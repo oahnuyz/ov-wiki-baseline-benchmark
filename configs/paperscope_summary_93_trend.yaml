@@ -1,0 +1,9 @@
+id: paperscope_summary_93_trend
+dataset: paperscope_summary
+raw_dataset: PaperScopeSummary93
+options:
+  document_scope: all
+  qa_type: trend
+expected:
+  qas: 117
+  documents: 93

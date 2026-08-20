@@ -1,0 +1,9 @@
+id: paperscope_summary_93_results_comparison
+dataset: paperscope_summary
+raw_dataset: PaperScopeSummary93
+options:
+  document_scope: all
+  qa_type: results_comparison
+expected:
+  qas: 116
+  documents: 93

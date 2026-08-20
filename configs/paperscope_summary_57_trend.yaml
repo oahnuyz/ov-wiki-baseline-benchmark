@@ -1,0 +1,9 @@
+id: paperscope_summary_57_trend
+dataset: paperscope_summary
+raw_dataset: PaperScopeSummary57
+options:
+  document_scope: valid
+  qa_type: trend
+expected:
+  qas: 117
+  documents: 57

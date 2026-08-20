@@ -1,0 +1,8 @@
+id: mdaqa_first_100
+dataset: mdaqa
+raw_dataset: MDAQAFirst100
+options:
+  selection: first_100_in_source_order
+expected:
+  qas: 100
+  documents: 143

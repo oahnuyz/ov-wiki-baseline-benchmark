@@ -1,0 +1,8 @@
+id: mudabench_simple
+dataset: mudabench
+raw_dataset: MuDABenchSimple
+options:
+  scope: simple
+expected:
+  qas: 166
+  documents: 589

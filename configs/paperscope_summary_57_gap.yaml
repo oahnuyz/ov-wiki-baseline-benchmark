@@ -1,0 +1,9 @@
+id: paperscope_summary_57_gap
+dataset: paperscope_summary
+raw_dataset: PaperScopeSummary57
+options:
+  document_scope: valid
+  qa_type: gap
+expected:
+  qas: 119
+  documents: 57

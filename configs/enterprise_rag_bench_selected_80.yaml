@@ -1,0 +1,11 @@
+id: enterprise_rag_bench_selected_80
+dataset: enterprise_rag_bench
+raw_dataset: EnterpriseRAGBenchSelected80
+options:
+  categories:
+    - project_related
+    - conflicting_info
+    - completeness
+expected:
+  qas: 80
+  documents: 323

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ov-wiki-baseline-benchmark"
+version = "0.1.0"
+description = "Baseline-neutral data preparation for the OV-Wiki benchmark"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0,<7",
+    "requests>=2.31,<3",
+    "tqdm>=4.66,<5",
+]
+
+[project.scripts]
+ov-wiki-data = "ov_wiki_baseline_benchmark.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

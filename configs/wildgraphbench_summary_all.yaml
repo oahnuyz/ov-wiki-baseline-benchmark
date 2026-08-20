@@ -1,0 +1,9 @@
+id: wildgraphbench_summary_all
+dataset: wildgraphbench_summary
+raw_dataset: WildGraphBenchSummaryAll
+options:
+  scope: all
+  qa_type: summary
+expected:
+  qas: 339
+  documents: 3894

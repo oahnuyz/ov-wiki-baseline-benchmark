@@ -1,0 +1,8 @@
+id: mudabench_complex
+dataset: mudabench
+raw_dataset: MuDABenchComplex
+options:
+  scope: complex
+expected:
+  qas: 166
+  documents: 589

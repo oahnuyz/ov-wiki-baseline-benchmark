@@ -1,0 +1,8 @@
+id: scholarqa_multi_valid_101
+dataset: scholarqa_multi
+raw_dataset: ScholarQAMultiValid101
+options:
+  selection: exclude_out_of_range_citations
+expected:
+  qas: 101
+  documents: 413

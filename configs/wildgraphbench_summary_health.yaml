@@ -1,0 +1,9 @@
+id: wildgraphbench_summary_health
+dataset: wildgraphbench_summary
+raw_dataset: WildGraphBenchSummaryHealth
+options:
+  scope: health
+  qa_type: summary
+expected:
+  qas: 55
+  documents: 509
