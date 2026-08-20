@@ -132,27 +132,17 @@ data/
 该模板与 OV-Wiki 当前 `vikingbot` 实验路径使用的指令保持一致。执行实验时，将 `{question}` 替换为 `qa.jsonl` 当前记录的 `question` 字段。
 
 ```text
-Answer this question as briefly as possible. Use only the information available in the database. Do not use any external source. Always use OpenViking tools first. Search first, then read the results to answer. Use the default OpenViking search scope; do not force a specific target_uri unless needed. Search results may come from original resources or wiki nodes. If wiki node documents are relevant, read them and use them as evidence together with original resources when useful.
-
+Answer this question as briefly as possible. Use only the information available in the database. Do not use any external source.
 Question: {question}
 ```
 
 ### 2. 通用 0–4 分 LLM Judge
 
-13 组实验统一采用同一套 LLM Judge 契约。机器可读的唯一模板为：
-
-- System prompt：[`prompts/generic_llm_judge_system.txt`](prompts/generic_llm_judge_system.txt)
-- User prompt：[`prompts/generic_llm_judge_user.txt`](prompts/generic_llm_judge_user.txt)
-
-System prompt：
+13 组实验统一采用同一套 LLM Judge 契约。机器可读的唯一模板为 [`prompts/generic_llm_judge_user.txt`](prompts/generic_llm_judge_user.txt)。
 
 ```text
 You are an expert evaluator scoring how well an AI-generated answer matches a gold standard (ground truth).
-```
 
-User prompt：
-
-```text
 Please score the Generated Answer against the Gold Answers on a scale of 0 to 4.
 
 [Evaluation Rubric]

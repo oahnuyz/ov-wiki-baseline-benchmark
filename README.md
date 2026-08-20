@@ -127,27 +127,17 @@ Source of truth: [`prompts/ov_wiki_bot_answer.txt`](prompts/ov_wiki_bot_answer.t
 The template is aligned with the OV-Wiki `vikingbot` experiment path. `{question}` is replaced with the current canonical QA record's `question` field.
 
 ```text
-Answer this question as briefly as possible. Use only the information available in the database. Do not use any external source. Always use OpenViking tools first. Search first, then read the results to answer. Use the default OpenViking search scope; do not force a specific target_uri unless needed. Search results may come from original resources or wiki nodes. If wiki node documents are relevant, read them and use them as evidence together with original resources when useful.
-
+Answer this question as briefly as possible. Use only the information available in the database. Do not use any external source.
 Question: {question}
 ```
 
 ### Generic 0–4 LLM judge
 
-All thirteen experiments use the same generic LLM judge contract. The machine-readable sources of truth are:
-
-- System prompt: [`prompts/generic_llm_judge_system.txt`](prompts/generic_llm_judge_system.txt)
-- User prompt: [`prompts/generic_llm_judge_user.txt`](prompts/generic_llm_judge_user.txt)
-
-System prompt:
+All thirteen experiments use the same generic LLM judge contract. The single machine-readable source of truth is [`prompts/generic_llm_judge_user.txt`](prompts/generic_llm_judge_user.txt).
 
 ```text
 You are an expert evaluator scoring how well an AI-generated answer matches a gold standard (ground truth).
-```
 
-User prompt:
-
-```text
 Please score the Generated Answer against the Gold Answers on a scale of 0 to 4.
 
 [Evaluation Rubric]

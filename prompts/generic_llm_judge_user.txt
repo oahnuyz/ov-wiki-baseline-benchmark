@@ -1,3 +1,5 @@
+You are an expert evaluator scoring how well an AI-generated answer matches a gold standard (ground truth).
+
 Please score the Generated Answer against the Gold Answers on a scale of 0 to 4.
 
 [Evaluation Rubric]
