@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,38 @@ class LlmWikiBridgeClient:
             "Authorization": f"Bearer {config.bridge_token()}",
             "Content-Type": "application/json",
         }
+
+    def wait_until_ready(self, project_path: Path) -> None:
+        deadline = time.monotonic() + self.config.startup_timeout_seconds
+        expected = str(project_path.resolve())
+        last_error = "benchmark frontend has not responded"
+        while time.monotonic() < deadline:
+            try:
+                response = requests.get(
+                    f"{self.base_url}/ready",
+                    headers=self.headers,
+                    timeout=min(10, self.config.startup_timeout_seconds),
+                )
+                if response.status_code == 200:
+                    value = response.json()
+                    if not isinstance(value, dict) or value.get("ready") is not True:
+                        raise RuntimeError("Bridge readiness response is not ready")
+                    actual = str(Path(str(value.get("projectPath", ""))).resolve())
+                    if actual != expected:
+                        raise RuntimeError(
+                            f"Bridge opened {actual!r}, expected {expected!r}"
+                        )
+                    return
+                if response.status_code != 503:
+                    response.raise_for_status()
+                last_error = response.text.strip() or f"HTTP {response.status_code}"
+            except (requests.RequestException, ValueError) as exc:
+                last_error = str(exc)
+            time.sleep(1)
+        raise RuntimeError(
+            "LLM Wiki benchmark frontend did not become ready within "
+            f"{self.config.startup_timeout_seconds}s: {last_error}"
+        )
 
     def create_run(self, *, corpus_id: str, project_path: Path) -> RunInfo:
         value = self._request(

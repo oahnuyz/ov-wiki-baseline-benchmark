@@ -148,7 +148,8 @@ Question: {question}
 fork 需要实现的接口见
 [`patches/llm_wiki/bridge_contract.md`](patches/llm_wiki/bridge_contract.md)，实际实现位于
 [`patches/llm_wiki/`](patches/llm_wiki/) 的两个顺序补丁中。`paths.project_path`
-指向一个已经打开的专用 LLM Wiki 项目；不同 corpus 组之间会完整清理并复用该项目。
+指向一个专用 LLM Wiki 项目。benchmark headless 模式下，隐藏 WebView 会自动初始化并打开
+该项目；runner 在开始前等待鉴权 readiness 接口，不同 corpus 组之间会完整清理并复用项目。
 
 ### 2. 通用 0–4 分 LLM Judge
 

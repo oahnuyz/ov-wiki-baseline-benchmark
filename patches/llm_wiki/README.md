@@ -38,6 +38,9 @@ telemetry described in `bridge_contract.md`:
 - benchmark-owned project cleanup with zero model-token cost;
 - fixed model/routing, built-in PDF parsing, captions, vector retrieval, and
   disabled web/AnyTXT/skills.
+- environment-driven benchmark headless startup: the main window stays hidden,
+  the dedicated General project is initialized/opened without user interaction,
+  and an authenticated readiness endpoint prevents startup races.
 
 The benchmark runner does not accept the stock LLM Wiki API as a benchmark bridge.
 Stock `AgentUsage` reports character counts, not provider tokens, and the stock API

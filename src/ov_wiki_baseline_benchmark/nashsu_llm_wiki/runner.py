@@ -20,6 +20,7 @@ from .models import QaResult, RunInfo, StageResult, TokenUsage
 
 
 class Bridge(Protocol):
+    def wait_until_ready(self, project_path: Path) -> None: ...
     def create_run(self, *, corpus_id: str, project_path: Path) -> RunInfo: ...
     def ingest(self, run_id: str, documents: list[Path]) -> StageResult: ...
     def answer(self, run_id: str, *, prompt: str, session_id: str) -> QaResult: ...
@@ -93,6 +94,7 @@ class BenchmarkRunner:
         # Reuse one already-open dedicated project. Each corpus group is fully
         # deleted before the next group, so no project switching is needed.
         project_path = self.config.project_path
+        self.bridge.wait_until_ready(project_path)
         run = self.bridge.create_run(corpus_id=corpus_id, project_path=project_path)
         run_id = run.run_id
         group_manifest: dict[str, Any] = {

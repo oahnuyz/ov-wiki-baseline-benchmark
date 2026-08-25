@@ -32,8 +32,9 @@ execution:
   review_sweep_in_ingest: true
   qa_workers: 1
   judge_workers: 1
+  startup_timeout_seconds: 300
   request_timeout_seconds: 1800
 
 paths:
-  output_dir: "~/ov-wiki-results/nashsu_llm_wiki"
-  project_path: "~/ov-wiki-projects/nashsu_llm_wiki"
+  output_dir: "~/nashsu-llm-wiki-baseline/results"
+  project_path: "~/nashsu-llm-wiki-baseline/project"

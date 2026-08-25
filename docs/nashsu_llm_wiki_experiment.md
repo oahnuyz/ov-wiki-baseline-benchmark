@@ -172,6 +172,8 @@ runner 将一个实验全部文档的 `sha256` 排序后串联，再计算 corpu
 | embedding batch size | 可配置 | `1` | Doubao vision embedding 本身不走 OpenAI 文本 batch |
 | chunk 参数 | 项目覆盖 / 官方默认 | 官方默认 | 清除 `maxChunkChars` / `overlapChunkChars` 项目覆盖 |
 | parsed Markdown 副本 | 开/关 | 关 | 固定 `persistExtractedMarkdown=false` |
+| headless 启动 | 可见桌面 / 隐藏 WebView | 隐藏 WebView | Xvfb 中保留官方前端入库链路，不需要人工点击 |
+| startup timeout | 可配置 | `300` 秒 | runner 等待 bridge 和专用项目就绪；不计入实验时间 |
 | bridge timeout | 可配置 | `1800` 秒 | 当前 YAML 对单次 HTTP 请求的超时 |
 
 ### 5.2 Agent mode 与 retrieval mode 是两个独立参数
@@ -224,12 +226,23 @@ Retrieval mode 的可选值为：
 
 ## 6. 实验前置状态
 
-1. `paths.project_path` 必须指向一个已经在 LLM Wiki 桌面端打开的专用项目。
+1. `paths.project_path` 必须指向专用项目；headless 模式会自动初始化空目录并打开它。
 2. 该项目不能与日常个人 Wiki 混用，因为删除轮会删除项目的 Wiki 和 `.llm-wiki` 运行数据。
 3. 同一专用项目在不同 corpus 组之间复用；每组结束后先完整删除本组数据。
 4. runner 校验 bridge 返回的 `maxContextSize=204800`、`top_k=5` 和 embedding 维度 1024。
-5. 环境中必须提供相同的 `LLM_WIKI_API_TOKEN`，并正确配置 Ark key。
+5. 环境中必须提供 `LLM_WIKI_API_TOKEN`、`ARK_API_KEY`、
+   `LLM_WIKI_BENCHMARK_HEADLESS=1` 和精确的 `LLM_WIKI_BENCHMARK_PROJECT_PATH`。
 6. 真实实验前必须确认专用项目没有旧的 `wiki/`、向量、review 或 staged corpus。
+
+服务器不需要可见桌面，也不需要人工操作 LLM Wiki 窗口。Tauri 仍在 Xvfb 中创建隐藏 WebView，
+因为官方入库队列、两阶段页面生成和 review sweep 位于 TypeScript 前端。Rust API 与前端执行
+双就绪握手：只有 bridge listener 已注册且环境变量指定的项目已打开时，鉴权的
+`GET /api/v1/benchmark/ready` 才返回 200；否则返回 503。runner 最多等待 300 秒。Xvfb
+启动、WebView 初始化、空 General 项目创建和打开均发生在任何实验计时之前。
+
+若项目目录为空，headless bootstrap 只写入官方 General 脚手架后打开项目；若目录非空但
+不是有效 LLM Wiki 项目，则直接失败，不猜测、不覆盖。Ark key 和 bridge token 不出现在
+readiness 响应、manifest 或日志中。
 
 本实验采用 **未经人工编辑的官方 General 项目模板**，不添加任何与数据集、问题或答案有关
 的先验信息。General 模板只提供 Nashsu 开箱即用的通用项目脚手架。每个新 corpus 从字节
@@ -257,7 +270,7 @@ manifest。
 
 runner 先校验 prepared 数据和共享 corpus fingerprint。bridge 创建 run 时验证：
 
-- 当前打开项目与 `project_path` 完全一致；
+- readiness 已确认当前打开项目与 `project_path` 完全一致；
 - 固定版本、模型、检索、caption、PDF 和 embedding manifest 完全一致；
 - 项目没有被另一个 benchmark run 占用。
 
@@ -714,15 +727,18 @@ Total Deletion Token Cost = 0
 - 入库或 QA 中任何已发出 provider 请求缺失真实 usage；
 - QA 返回空 answer 或缺少 session ID；
 - 删除产生任何非零模型/embedding token；
-- bridge token 缺失或错误。
+- bridge token 缺失或错误；
+- headless bridge listener 或指定项目在 300 秒内未就绪；
+- headless 项目目录非空但不是有效 LLM Wiki 项目。
 
 ## 14. 真实实验前仍需实施或验证的事项
 
 模式与输入原则已经确定：官方 General 模板不做人工编辑、`mode=standard`、
 `retrievalMode=standard`，并且不增加 QA 动作硬限制。正式实验前还剩以下实施或环境验证项：
 
-1. **完整编译验证**：两个补丁已通过顺序 `git apply --check`，但尚未在完整 Node/Rust
-   依赖环境中编译和运行 LLM Wiki 测试。
+1. **服务器完整编译验证**：两个补丁已通过顺序 `git apply --check`，本地 TypeScript
+   类型检查与 mock 测试已通过；仍需在服务器的用户态 Node/Tauri sysroot 中完成 Rust/Linux
+   编译和 Xvfb 启动验证。
 2. **Agent trace smoke test**：不增加动作 allowlist，也不强制至少一次检索；但需验证真实
    Ark 模型能稳定遵守 Agent JSON 协议，并确认逐题输出完整记录工具序列。直接 final 或理论
    上出现的非检索动作保留为 Nashsu 官方行为，应通过 trace 审计而不是修改算法。

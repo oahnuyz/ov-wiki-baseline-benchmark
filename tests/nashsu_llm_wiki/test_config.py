@@ -22,6 +22,12 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(manifest["llmWiki"]["outputLanguage"], "auto")
         self.assertEqual(manifest["llmWiki"]["chunking"], "official_default")
         self.assertIs(manifest["llmWiki"]["persistExtractedMarkdown"], False)
+        self.assertEqual(config.startup_timeout_seconds, 300)
+        self.assertTrue(
+            str(config.project_path).endswith(
+                "/nashsu-llm-wiki-baseline/project"
+            )
+        )
 
     def test_config_rejects_parallel_qa(self) -> None:
         source = (

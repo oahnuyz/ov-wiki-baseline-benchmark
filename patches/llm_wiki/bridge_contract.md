@@ -7,6 +7,38 @@ ranking, prompt content, Wiki generation, review resolution, or answer generatio
 All routes are under `/api/v1/benchmark`, bind to loopback only, and require the
 same `LLM_WIKI_API_TOKEN` authentication as paid/mutating stock API routes.
 
+## Headless bootstrap
+
+The Tauri process still runs the official WebView-side ingest pipeline, but the
+window is hidden and no interactive desktop action is required. Startup requires:
+
+```text
+LLM_WIKI_BENCHMARK_HEADLESS=1
+LLM_WIKI_BENCHMARK_PROJECT_PATH=/absolute/dedicated/project
+LLM_WIKI_API_TOKEN=<random bridge token>
+ARK_API_KEY=<Volcengine credential>
+```
+
+The frontend initializes an empty target with the official General scaffold,
+opens it, installs the bridge listener, and marks the exact project ready. It
+rejects a non-empty invalid directory and never returns either secret through
+the readiness API.
+
+## `GET /ready`
+
+Returns HTTP 503 until both the frontend listener and exact dedicated project
+are ready. A successful authenticated response is:
+
+```json
+{
+  "ready": true,
+  "projectPath": "/absolute/dedicated/project"
+}
+```
+
+The Python runner waits for this response before creating the first run. Startup
+and project-open time are outside all measured experiment stages.
+
 ## Required invariants
 
 - LLM Wiki `0.6.11` at commit `e8082119649e6a8e1cf85eaf289adcabfdf39d4e`.
@@ -55,8 +87,9 @@ must return three zeroes.
 
 ## `POST /runs`
 
-Starts a benchmark run against a dedicated, already opened project. It validates
-the complete fixed config and resets only the in-memory telemetry accumulator.
+Starts a benchmark run against the dedicated project opened by headless bootstrap
+(or manually in normal desktop mode). It validates the complete fixed config and
+resets only the in-memory telemetry accumulator.
 
 Request:
 

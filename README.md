@@ -143,8 +143,10 @@ records provider-reported input/output/embedding tokens and fails closed if any
 measured stage has incomplete telemetry. See
 [`patches/llm_wiki/bridge_contract.md`](patches/llm_wiki/bridge_contract.md) for
 the fork interface and apply both patches in [`patches/llm_wiki/`](patches/llm_wiki/).
-`paths.project_path` is one dedicated LLM Wiki project that must already be open;
-the runner fully cleans and reuses it between different corpus groups.
+`paths.project_path` is one dedicated LLM Wiki project. In benchmark headless
+mode the hidden WebView initializes and opens it automatically; the runner waits
+for the authenticated readiness endpoint before starting and fully cleans and
+reuses the project between corpus groups.
 
 ### Generic 0–4 LLM judge
 

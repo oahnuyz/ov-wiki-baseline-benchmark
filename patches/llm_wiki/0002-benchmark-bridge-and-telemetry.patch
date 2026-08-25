@@ -48,7 +48,7 @@ index 528da2c..c61a11e 100644
              .client
              .post(url)
 diff --git a/src-tauri/src/api_server.rs b/src-tauri/src/api_server.rs
-index 796c75c..563c4d6 100644
+index 796c75c..d8a7c2e 100644
 --- a/src-tauri/src/api_server.rs
 +++ b/src-tauri/src/api_server.rs
 @@ -1,4 +1,4 @@
@@ -98,10 +98,11 @@ index 796c75c..563c4d6 100644
      if method == Method::Options {
          respond_options(request, origin.as_deref());
          return;
-@@ -366,6 +384,16 @@ fn handle_request(
+@@ -366,6 +384,17 @@ fn handle_request(
          (&Method::Post, ["projects", project_id, "chat", session_id, "cancel"]) => {
              handle_cancel_chat(app, project_id, session_id)
          }
++        (&Method::Get, ["benchmark", "ready"]) => handle_benchmark_ready(),
 +        (&Method::Post, ["benchmark", "runs"]) => handle_benchmark_create(app, body),
 +        (&Method::Post, ["benchmark", "runs", run_id, "ingest"]) => {
 +            handle_benchmark_ingest(app, run_id, body)
@@ -115,17 +116,17 @@ index 796c75c..563c4d6 100644
          _ => err(404, "Not found"),
      }
  }
-@@ -413,6 +441,9 @@ fn is_token_required_request(method: &Method, path: &str) -> bool {
+@@ -413,6 +442,9 @@ fn is_token_required_request(method: &Method, path: &str) -> bool {
      let Some(parts) = api_path_parts(path) else {
          return false;
      };
-+    if method == &Method::Post && parts.first().copied() == Some("benchmark") {
++    if parts.first().copied() == Some("benchmark") {
 +        return true;
 +    }
      method == &Method::Post && matches!(parts.as_slice(), ["projects", _, "pages", "embed"])
  }
  
-@@ -2012,6 +2043,330 @@ fn handle_chat(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
+@@ -2012,6 +2044,343 @@ fn handle_chat(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
      }
  }
  
@@ -140,6 +141,16 @@ index 796c75c..563c4d6 100644
 +        .get(run_id)
 +        .cloned()
 +        .ok_or_else(|| err(404, format!("Unknown benchmark run: {run_id}")))
++}
++
++fn handle_benchmark_ready() -> ApiResponse {
++    match benchmark::ready_project_path() {
++        Some(project_path) => ok(json!({
++            "ready": true,
++            "projectPath": project_path,
++        })),
++        None => err(503, "Benchmark frontend is still starting"),
++    }
 +}
 +
 +fn handle_benchmark_create(app: &AppHandle, body: &str) -> ApiResponse {
@@ -161,6 +172,9 @@ index 796c75c..563c4d6 100644
 +        .to_string();
 +    if corpus_id.is_empty() || project_path.is_empty() || value.get("config").is_none() {
 +        return err(400, "corpusId, projectPath, and config are required");
++    }
++    if !benchmark::frontend_ready_for(&project_path) {
++        return err(503, "Benchmark frontend is not ready for this project");
 +    }
 +    let project = match resolve_project(app, &project_path) {
 +        Ok(project) => project,
@@ -456,7 +470,7 @@ index 796c75c..563c4d6 100644
  struct SseReader {
      receiver: Receiver<Vec<u8>>,
      current: Cursor<Vec<u8>>,
-@@ -3188,6 +3543,14 @@ mod tests {
+@@ -3188,6 +3557,14 @@ mod tests {
              &Method::Post,
              "/api/v1/projects/current/chat"
          ));
@@ -471,7 +485,7 @@ index 796c75c..563c4d6 100644
          assert!(!is_token_required_request(
              &Method::Post,
              "/api/v1/projects/current/search"
-@@ -3198,6 +3561,26 @@ mod tests {
+@@ -3198,6 +3575,26 @@ mod tests {
          ));
      }
  
@@ -500,10 +514,10 @@ index 796c75c..563c4d6 100644
          let path = "/api/v1/projects/current/chat";
 diff --git a/src-tauri/src/benchmark.rs b/src-tauri/src/benchmark.rs
 new file mode 100644
-index 0000000..8686559
+index 0000000..a49a959
 --- /dev/null
 +++ b/src-tauri/src/benchmark.rs
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,316 @@
 +use std::collections::HashMap;
 +use std::sync::mpsc::{self, SyncSender};
 +use std::sync::{Mutex, OnceLock};
@@ -513,6 +527,25 @@ index 0000000..8686559
 +use serde_json::{json, Value};
 +use tauri::{AppHandle, Emitter};
 +use uuid::Uuid;
++
++const HEADLESS_ENV: &str = "LLM_WIKI_BENCHMARK_HEADLESS";
++const PROJECT_PATH_ENV: &str = "LLM_WIKI_BENCHMARK_PROJECT_PATH";
++const ARK_API_KEY_ENV: &str = "ARK_API_KEY";
++const BRIDGE_TOKEN_ENV: &str = "LLM_WIKI_API_TOKEN";
++
++#[derive(Debug, Clone, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct BootstrapConfig {
++    enabled: bool,
++    project_path: String,
++    ark_api_key: String,
++}
++
++#[derive(Default)]
++struct FrontendReadiness {
++    listener_ready: bool,
++    project_path: Option<String>,
++}
 +
 +#[derive(Debug, Clone, Default, Serialize)]
 +#[serde(rename_all = "camelCase")]
@@ -539,6 +572,101 @@ index 0000000..8686559
 +static USAGE: OnceLock<Mutex<UsageState>> = OnceLock::new();
 +static PENDING: OnceLock<Mutex<HashMap<String, SyncSender<Result<Value, String>>>>> =
 +    OnceLock::new();
++static FRONTEND_READINESS: OnceLock<Mutex<FrontendReadiness>> = OnceLock::new();
++
++fn readiness() -> &'static Mutex<FrontendReadiness> {
++    FRONTEND_READINESS.get_or_init(|| Mutex::new(FrontendReadiness::default()))
++}
++
++fn normalized_path(value: &str) -> String {
++    value.trim().replace('\\', "/").trim_end_matches('/').to_string()
++}
++
++fn required_env(name: &str) -> Result<String, String> {
++    std::env::var(name)
++        .ok()
++        .map(|value| value.trim().to_string())
++        .filter(|value| !value.is_empty())
++        .ok_or_else(|| format!("{name} is required in benchmark headless mode"))
++}
++
++pub fn headless_enabled() -> bool {
++    std::env::var(HEADLESS_ENV)
++        .ok()
++        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
++        .unwrap_or(false)
++}
++
++pub fn bootstrap_config() -> Result<BootstrapConfig, String> {
++    if !headless_enabled() {
++        return Ok(BootstrapConfig {
++            enabled: false,
++            project_path: String::new(),
++            ark_api_key: String::new(),
++        });
++    }
++    let project_path = normalized_path(&required_env(PROJECT_PATH_ENV)?);
++    let path = std::path::Path::new(&project_path);
++    if !path.is_absolute() || path.parent().is_none() || project_path == "/" {
++        return Err(format!("{PROJECT_PATH_ENV} must be a safe absolute project path"));
++    }
++    let ark_api_key = required_env(ARK_API_KEY_ENV)?;
++    required_env(BRIDGE_TOKEN_ENV)?;
++    Ok(BootstrapConfig {
++        enabled: true,
++        project_path,
++        ark_api_key,
++    })
++}
++
++pub fn mark_listener_ready() -> Result<(), String> {
++    let mut state = readiness()
++        .lock()
++        .map_err(|_| "Benchmark readiness lock is unavailable".to_string())?;
++    state.listener_ready = true;
++    Ok(())
++}
++
++pub fn mark_project_ready(project_path: &str) -> Result<(), String> {
++    let expected = bootstrap_config()?;
++    if !expected.enabled {
++        return Err("Benchmark headless mode is not enabled".to_string());
++    }
++    let project_path = normalized_path(project_path);
++    if project_path != expected.project_path {
++        return Err("Benchmark frontend opened a different project path".to_string());
++    }
++    let root = std::path::Path::new(&project_path);
++    if !root.join("schema.md").is_file() || !root.join("wiki").is_dir() {
++        return Err("Benchmark project scaffold is incomplete".to_string());
++    }
++    let mut state = readiness()
++        .lock()
++        .map_err(|_| "Benchmark readiness lock is unavailable".to_string())?;
++    state.project_path = Some(project_path);
++    Ok(())
++}
++
++pub fn frontend_ready_for(project_path: &str) -> bool {
++    let expected = normalized_path(project_path);
++    readiness()
++        .lock()
++        .map(|state| {
++            state.listener_ready
++                && state.project_path.as_deref() == Some(expected.as_str())
++        })
++        .unwrap_or(false)
++}
++
++pub fn ready_project_path() -> Option<String> {
++    readiness().lock().ok().and_then(|state| {
++        if state.listener_ready {
++            state.project_path.clone()
++        } else {
++            None
++        }
++    })
++}
 +
 +fn usage() -> &'static Mutex<UsageState> {
 +    USAGE.get_or_init(|| Mutex::new(UsageState::default()))
@@ -690,6 +818,61 @@ index 0000000..8686559
 +pub fn benchmark_telemetry_finish(stage: String) -> Result<UsageSnapshot, String> {
 +    finish(&stage)
 +}
++
++#[tauri::command]
++pub fn benchmark_bootstrap_config() -> Result<BootstrapConfig, String> {
++    bootstrap_config()
++}
++
++#[tauri::command]
++pub fn benchmark_bridge_listener_ready() -> Result<(), String> {
++    mark_listener_ready()
++}
++
++#[tauri::command]
++pub fn benchmark_project_ready(project_path: String) -> Result<(), String> {
++    mark_project_ready(&project_path)?;
++    crate::clip_server::set_current_project_path(&project_path)
++}
+diff --git a/src-tauri/src/clip_server.rs b/src-tauri/src/clip_server.rs
+index 973a641..67e9564 100644
+--- a/src-tauri/src/clip_server.rs
++++ b/src-tauri/src/clip_server.rs
+@@ -46,6 +46,18 @@ pub fn current_project_path() -> String {
+         .unwrap_or_default()
+ }
+ 
++pub fn set_current_project_path(path: &str) -> Result<(), String> {
++    let normalized = path.trim().replace('\\', "/");
++    if normalized.is_empty() {
++        return Err("Project path cannot be empty".to_string());
++    }
++    let mut current = CURRENT_PROJECT
++        .lock()
++        .map_err(|_| "Current project lock is unavailable".to_string())?;
++    *current = normalized;
++    Ok(())
++}
++
+ pub fn all_projects() -> Vec<(String, String)> {
+     ALL_PROJECTS
+         .lock()
+@@ -389,12 +401,9 @@ fn handle_set_project(body: &str) -> String {
+         None => return r#"{"ok":false,"error":"path field is required"}"#.to_string(),
+     };
+ 
+-    match CURRENT_PROJECT.lock() {
+-        Ok(mut guard) => {
+-            *guard = path;
+-            r#"{"ok":true}"#.to_string()
+-        }
+-        Err(e) => format!(r#"{{"ok":false,"error":"Lock error: {}"}}"#, e),
++    match set_current_project_path(&path) {
++        Ok(()) => r#"{"ok":true}"#.to_string(),
++        Err(error) => format!(r#"{{"ok":false,"error":"{}"}}"#, error),
+     }
+ }
+ 
 diff --git a/src-tauri/src/commands/search.rs b/src-tauri/src/commands/search.rs
 index b35a5ed..742c89c 100644
 --- a/src-tauri/src/commands/search.rs
@@ -715,7 +898,7 @@ index b35a5ed..742c89c 100644
          .map_err(EmbeddingFetchError::Other)?;
      if let Some(raw_expected) = cfg.output_dimensionality {
 diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
-index 870155c..e7818e5 100644
+index 870155c..338f1e4 100644
 --- a/src-tauri/src/lib.rs
 +++ b/src-tauri/src/lib.rs
 @@ -1,5 +1,6 @@
@@ -725,29 +908,72 @@ index 870155c..e7818e5 100644
  mod clip_server;
  mod commands;
  mod cors;
-@@ -662,6 +663,9 @@ pub fn run() {
+@@ -566,6 +567,14 @@ pub fn run() {
+         // from Rust, never the webview.
+         .plugin(tauri_plugin_http::init())
+         .setup(|app| {
++            let benchmark_headless = benchmark::headless_enabled();
++            if benchmark_headless {
++                if let Some(window) = app.get_webview_window("main") {
++                    if let Err(error) = window.hide() {
++                        eprintln!("[benchmark] failed to hide the main window: {error}");
++                    }
++                }
++            }
+             // Let the PDF extractor find the bundled pdfium dynamic
+             // library via Tauri's platform-correct resource path.
+             if let Ok(dir) = app.path().resource_dir() {
+@@ -604,11 +613,15 @@ pub fn run() {
+             // backend is reachable if tray setup or another integration fails.
+             clip_server::start_clip_server(app.handle().clone());
+             api_server::start_api_server(app.handle().clone());
+-            let tray_available = match tray::create_tray(app.handle()) {
+-                Ok(()) => true,
+-                Err(err) => {
+-                    eprintln!("[tray] system tray unavailable, continuing without it: {err}");
+-                    false
++            let tray_available = if benchmark_headless {
++                false
++            } else {
++                match tray::create_tray(app.handle()) {
++                    Ok(()) => true,
++                    Err(err) => {
++                        eprintln!("[tray] system tray unavailable, continuing without it: {err}");
++                        false
++                    }
+                 }
+             };
+             match app.state::<TrayAvailabilityState>().0.lock() {
+@@ -662,6 +675,12 @@ pub fn run() {
              clip_server_status,
              api_server_status,
              api_server_reload_config,
 +            benchmark::benchmark_bridge_complete,
 +            benchmark::benchmark_telemetry_begin,
 +            benchmark::benchmark_telemetry_finish,
++            benchmark::benchmark_bootstrap_config,
++            benchmark::benchmark_bridge_listener_ready,
++            benchmark::benchmark_project_ready,
              agent_start_turn,
              agent_start_turn_stream,
              agent_cancel_turn,
 diff --git a/src/App.tsx b/src/App.tsx
-index 071e8dd..350ae5b 100644
+index 071e8dd..1746b77 100644
 --- a/src/App.tsx
 +++ b/src/App.tsx
-@@ -20,6 +20,7 @@ import { WelcomeScreen } from "@/components/project/welcome-screen"
+@@ -20,6 +20,11 @@ import { WelcomeScreen } from "@/components/project/welcome-screen"
  import { CreateProjectDialog } from "@/components/project/create-project-dialog"
  import type { WikiProject } from "@/types/wiki"
  import { useAppDialog } from "@/stores/app-dialog-store"
-+import { installBenchmarkBridge } from "@/lib/benchmark-bridge"
++import {
++  bootstrapBenchmarkProject,
++  installBenchmarkBridge,
++  markBenchmarkProjectReady,
++} from "@/lib/benchmark-bridge"
  
  function applyDocumentZoom(level: number) {
    document.documentElement.style.fontSize = `${BASE_FONT_SIZE_PX * level}px`
-@@ -36,6 +37,19 @@ function App() {
+@@ -36,6 +41,19 @@ function App() {
    const [showCreateDialog, setShowCreateDialog] = useState(false)
    const [loading, setLoading] = useState(true)
  
@@ -767,15 +993,154 @@ index 071e8dd..350ae5b 100644
    function isCurrentProject(proj: WikiProject): boolean {
      const current = useWikiStore.getState().project
      return current?.id === proj.id && current.path === proj.path
+@@ -412,6 +430,12 @@ function App() {
+         if (savedLang) {
+           await i18n.changeLanguage(savedLang)
+         }
++        const benchmarkProject = await bootstrapBenchmarkProject()
++        if (benchmarkProject) {
++          await handleProjectOpened(benchmarkProject)
++          await markBenchmarkProjectReady(benchmarkProject.path)
++          return
++        }
+         const lastProject = await getLastProject()
+         if (lastProject) {
+           try {
+@@ -421,8 +445,8 @@ function App() {
+             // Last project no longer valid
+           }
+         }
+-      } catch {
+-        // ignore init errors
++      } catch (error) {
++        console.error("[startup] initialization failed:", error)
+       } finally {
+         setLoading(false)
+       }
+diff --git a/src/lib/benchmark-bridge-bootstrap.test.ts b/src/lib/benchmark-bridge-bootstrap.test.ts
+new file mode 100644
+index 0000000..5d8aa17
+--- /dev/null
++++ b/src/lib/benchmark-bridge-bootstrap.test.ts
+@@ -0,0 +1,109 @@
++import { beforeEach, describe, expect, it, vi } from "vitest"
++
++const mocks = vi.hoisted(() => ({
++  invoke: vi.fn(),
++  listen: vi.fn(),
++  openProject: vi.fn(),
++  createDirectory: vi.fn(),
++  listDirectory: vi.fn(),
++  writeFile: vi.fn(),
++  setLlmConfig: vi.fn(),
++  setGlobalLlmConfig: vi.fn(),
++  setEmbeddingConfig: vi.fn(),
++}))
++
++vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }))
++vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }))
++vi.mock("@/commands/fs", () => ({
++  copyFile: vi.fn(),
++  createDirectory: mocks.createDirectory,
++  listDirectory: mocks.listDirectory,
++  openProject: mocks.openProject,
++  writeFile: mocks.writeFile,
++}))
++vi.mock("./benchmark-telemetry", () => ({
++  beginBenchmarkLlmTelemetry: vi.fn(),
++  finishBenchmarkLlmTelemetry: vi.fn(),
++}))
++vi.mock("./ingest-queue", () => ({
++  clearQueueState: vi.fn(),
++  enqueueBatchAndWaitForSweep: vi.fn(),
++  setIngestWorkerLimit: vi.fn(),
++}))
++vi.mock("./project-store", () => ({
++  saveEmbeddingConfig: vi.fn(),
++  saveLlmConfig: vi.fn(),
++  saveMineruConfig: vi.fn(),
++  saveMultimodalConfig: vi.fn(),
++  saveOutputLanguage: vi.fn(),
++  saveProjectLlmOverride: vi.fn(),
++  saveSearchApiConfig: vi.fn(),
++  saveSourceWatchConfig: vi.fn(),
++  saveTaskModelRouting: vi.fn(),
++}))
++vi.mock("./templates", () => ({
++  getTemplate: () => ({ purpose: "general purpose", schema: "general schema" }),
++}))
++vi.mock("@/stores/wiki-store", () => ({
++  useWikiStore: {
++    getState: () => ({
++      llmConfig: { apiKey: "" },
++      embeddingConfig: { apiKey: "" },
++      setLlmConfig: mocks.setLlmConfig,
++      setGlobalLlmConfig: mocks.setGlobalLlmConfig,
++      setEmbeddingConfig: mocks.setEmbeddingConfig,
++    }),
++  },
++}))
++vi.mock("@/stores/review-store", () => ({
++  useReviewStore: { getState: () => ({ setItems: vi.fn() }) },
++}))
++vi.mock("@/stores/lint-store", () => ({
++  useLintStore: { getState: () => ({ setItems: vi.fn() }) },
++}))
++
++import { bootstrapBenchmarkProject } from "./benchmark-bridge"
++
++describe("benchmark headless bootstrap", () => {
++  beforeEach(() => {
++    vi.clearAllMocks()
++    mocks.invoke.mockResolvedValue({
++      enabled: true,
++      projectPath: "/benchmark/project",
++      arkApiKey: "ark-secret",
++    })
++    mocks.createDirectory.mockResolvedValue(undefined)
++    mocks.writeFile.mockResolvedValue(undefined)
++    mocks.listDirectory.mockResolvedValue([])
++  })
++
++  it("initializes an empty General project and injects the environment key", async () => {
++    mocks.openProject
++      .mockRejectedValueOnce(new Error("missing schema"))
++      .mockResolvedValueOnce({ id: "project-id", name: "project", path: "/benchmark/project" })
++
++    const project = await bootstrapBenchmarkProject()
++
++    expect(project?.id).toBe("project-id")
++    expect(mocks.writeFile).toHaveBeenCalledWith(
++      "/benchmark/project/purpose.md",
++      "general purpose",
++    )
++    expect(mocks.writeFile).toHaveBeenCalledWith(
++      "/benchmark/project/schema.md",
++      "general schema",
++    )
++    expect(mocks.setLlmConfig).toHaveBeenCalledWith({ apiKey: "ark-secret" })
++    expect(mocks.setEmbeddingConfig).toHaveBeenCalledWith({ apiKey: "ark-secret" })
++  })
++
++  it("refuses to initialize a non-empty invalid directory", async () => {
++    mocks.openProject.mockRejectedValue(new Error("missing schema"))
++    mocks.listDirectory.mockResolvedValue([
++      { name: "existing.txt", path: "/benchmark/project/existing.txt", is_dir: false },
++    ])
++
++    await expect(bootstrapBenchmarkProject()).rejects.toThrow("non-empty but invalid")
++    expect(mocks.writeFile).not.toHaveBeenCalled()
++  })
++})
 diff --git a/src/lib/benchmark-bridge.ts b/src/lib/benchmark-bridge.ts
 new file mode 100644
-index 0000000..8b66955
+index 0000000..1a93354
 --- /dev/null
 +++ b/src/lib/benchmark-bridge.ts
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,393 @@
 +import { invoke } from "@tauri-apps/api/core"
 +import { listen, type UnlistenFn } from "@tauri-apps/api/event"
-+import { copyFile, createDirectory, listDirectory, writeFile } from "@/commands/fs"
++import { copyFile, createDirectory, listDirectory, openProject, writeFile } from "@/commands/fs"
 +import { beginBenchmarkLlmTelemetry, finishBenchmarkLlmTelemetry } from "./benchmark-telemetry"
 +import {
 +  clearQueueState,
@@ -855,6 +1220,12 @@ index 0000000..8b66955
 +  outputTokens: number
 +  embeddingTokens: number
 +  complete: boolean
++}
++
++interface BenchmarkBootstrapConfig {
++  enabled: boolean
++  projectPath: string
++  arkApiKey: string
 +}
 +
 +function requireActiveProject(projectPath: unknown) {
@@ -956,6 +1327,41 @@ index 0000000..8b66955
 +    persistExtractedMarkdown: false,
 +    fileSha256: hashes,
 +  }
++}
++
++export async function bootstrapBenchmarkProject() {
++  const config = await invoke<BenchmarkBootstrapConfig>("benchmark_bootstrap_config")
++  if (!config.enabled) return null
++  const projectPath = normalizePath(config.projectPath)
++  if (!projectPath.startsWith("/") || !config.arkApiKey.trim()) {
++    throw new Error("Benchmark bootstrap configuration is incomplete")
++  }
++
++  let project
++  try {
++    project = await openProject(projectPath)
++  } catch (openError) {
++    await createDirectory(projectPath)
++    const entries = await listDirectory(projectPath, { includeHidden: true, maxDepth: 1 })
++    if (entries.length > 0) {
++      throw new Error(
++        `Benchmark project is non-empty but invalid: ${String(openError)}`,
++      )
++    }
++    await restoreGeneralScaffold(projectPath)
++    project = await openProject(projectPath)
++  }
++
++  const state = useWikiStore.getState()
++  const llm = { ...state.llmConfig, apiKey: config.arkApiKey }
++  state.setLlmConfig(llm)
++  state.setGlobalLlmConfig(llm)
++  state.setEmbeddingConfig({ ...state.embeddingConfig, apiKey: config.arkApiKey })
++  return project
++}
++
++export async function markBenchmarkProjectReady(projectPath: string): Promise<void> {
++  await invoke("benchmark_project_ready", { projectPath })
 +}
 +
 +async function configureRun(payload: Record<string, unknown>) {
@@ -1106,7 +1512,7 @@ index 0000000..8b66955
 +}
 +
 +export async function installBenchmarkBridge(): Promise<UnlistenFn> {
-+  return listen<BridgeRequest>("llm-wiki://benchmark-request", async ({ payload }) => {
++  const unlisten = await listen<BridgeRequest>("llm-wiki://benchmark-request", async ({ payload }) => {
 +    try {
 +      const result = await execute(payload)
 +      await invoke("benchmark_bridge_complete", {
@@ -1122,6 +1528,8 @@ index 0000000..8b66955
 +      })
 +    }
 +  })
++  await invoke("benchmark_bridge_listener_ready")
++  return unlisten
 +}
 diff --git a/src/lib/benchmark-telemetry.test.ts b/src/lib/benchmark-telemetry.test.ts
 new file mode 100644

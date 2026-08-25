@@ -25,6 +25,7 @@ class BenchmarkConfig:
     embedding_input: str
     output_dir: Path
     project_path: Path
+    startup_timeout_seconds: int
     request_timeout_seconds: int
 
     @classmethod
@@ -68,6 +69,7 @@ class BenchmarkConfig:
             embedding_input=_text(embedding, "input"),
             output_dir=Path(_text(paths, "output_dir")).expanduser().resolve(),
             project_path=Path(_text(paths, "project_path")).expanduser().resolve(),
+            startup_timeout_seconds=_integer(execution, "startup_timeout_seconds"),
             request_timeout_seconds=_integer(execution, "request_timeout_seconds"),
         )
         cfg.validate()
@@ -100,8 +102,8 @@ class BenchmarkConfig:
         ]
         if mismatches:
             raise ValueError("Invalid fixed benchmark config: " + "; ".join(mismatches))
-        if self.request_timeout_seconds <= 0:
-            raise ValueError("request_timeout_seconds must be positive")
+        if self.startup_timeout_seconds <= 0 or self.request_timeout_seconds <= 0:
+            raise ValueError("startup and request timeouts must be positive")
 
     def bridge_token(self) -> str:
         return _required_env(self.bridge_token_env)

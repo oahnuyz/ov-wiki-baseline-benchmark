@@ -29,6 +29,10 @@ class FakeBridge:
         self.sessions: list[str] = []
         self.deleted = False
         self.project_paths: list[Path] = []
+        self.ready_paths: list[Path] = []
+
+    def wait_until_ready(self, project_path: Path) -> None:
+        self.ready_paths.append(project_path)
 
     def create_run(self, *, corpus_id: str, project_path: Path) -> RunInfo:
         self.project_paths.append(project_path)
@@ -95,6 +99,7 @@ class RunnerTests(unittest.TestCase):
                 embedding_input="multimodal",
                 output_dir=root / "output",
                 project_path=root / "project",
+                startup_timeout_seconds=30,
                 request_timeout_seconds=30,
             )
             bridge = FakeBridge()
@@ -108,6 +113,7 @@ class RunnerTests(unittest.TestCase):
             runner.run_group([experiment])
 
             self.assertTrue(bridge.deleted)
+            self.assertEqual(bridge.ready_paths, [root / "project"])
             self.assertEqual(bridge.project_paths, [root / "project"])
             self.assertEqual(len(set(bridge.sessions)), 2)
             self.assertEqual(
