@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 ov-wiki-data = "ov_wiki_baseline_benchmark.cli:main"
+ov-wiki-nashsu = "ov_wiki_baseline_benchmark.nashsu_llm_wiki.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

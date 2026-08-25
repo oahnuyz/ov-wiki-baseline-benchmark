@@ -1,2 +1,3 @@
 Answer this question as briefly as possible. Use only the information available in the database. Do not use any external source.
+
 Question: {question}

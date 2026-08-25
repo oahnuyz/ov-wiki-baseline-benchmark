@@ -1,0 +1,39 @@
+bridge:
+  base_url: "http://127.0.0.1:19828"
+  token_env: "LLM_WIKI_API_TOKEN"
+
+model:
+  name: "doubao-seed-2-0-lite-260428"
+  provider: "volcengine"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key_env: "ARK_API_KEY"
+  temperature: 0
+  thinking: "disabled"
+
+embedding:
+  name: "doubao-embedding-vision-251215"
+  provider: "volcengine"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  dimensions: 1024
+  input: "multimodal"
+
+execution:
+  mode: "standard"
+  retrieval_mode: "standard"
+  top_k: "official_default"
+  max_context_size: "official_default"
+  project_template: "general"
+  output_language: "auto"
+  chunking: "official_default"
+  persist_extracted_markdown: false
+  vector_retrieval: true
+  pdf_parser: "builtin"
+  image_captioning: true
+  review_sweep_in_ingest: true
+  qa_workers: 1
+  judge_workers: 1
+  request_timeout_seconds: 1800
+
+paths:
+  output_dir: "~/ov-wiki-results/nashsu_llm_wiki"
+  project_path: "~/ov-wiki-projects/nashsu_llm_wiki"

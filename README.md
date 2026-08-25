@@ -128,8 +128,23 @@ The template is aligned with the OV-Wiki `vikingbot` experiment path. `{question
 
 ```text
 Answer this question as briefly as possible. Use only the information available in the database. Do not use any external source.
+
 Question: {question}
 ```
+
+### Nashsu LLM Wiki baseline branch
+
+The `nashsu_llm_wiki` branch adds a strict three-stage runner for LLM Wiki
+`0.6.11` at commit `e8082119649e6a8e1cf85eaf289adcabfdf39d4e`.
+
+The runner groups experiments by canonical corpus hash, so variants that share an
+identical corpus are ingested once, evaluated independently, and deleted once. It
+records provider-reported input/output/embedding tokens and fails closed if any
+measured stage has incomplete telemetry. See
+[`patches/llm_wiki/bridge_contract.md`](patches/llm_wiki/bridge_contract.md) for
+the fork interface and apply both patches in [`patches/llm_wiki/`](patches/llm_wiki/).
+`paths.project_path` is one dedicated LLM Wiki project that must already be open;
+the runner fully cleans and reuses it between different corpus groups.
 
 ### Generic 0–4 LLM judge
 

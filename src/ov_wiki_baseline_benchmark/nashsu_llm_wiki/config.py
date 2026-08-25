@@ -1,0 +1,184 @@
+"""Configuration contract for the Nashsu LLM Wiki baseline."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    bridge_base_url: str
+    bridge_token_env: str
+    ark_api_key_env: str
+    model: str
+    model_provider: str
+    model_base_url: str
+    embedding_model: str
+    embedding_provider: str
+    embedding_base_url: str
+    embedding_dimensions: int
+    embedding_input: str
+    output_dir: Path
+    project_path: Path
+    request_timeout_seconds: int
+
+    @classmethod
+    def from_yaml(cls, path: Path) -> "BenchmarkConfig":
+        with path.open("r", encoding="utf-8") as handle:
+            raw = yaml.safe_load(handle)
+        if not isinstance(raw, dict):
+            raise ValueError(f"Benchmark config must be a mapping: {path}")
+        bridge = _mapping(raw, "bridge")
+        model = _mapping(raw, "model")
+        embedding = _mapping(raw, "embedding")
+        paths = _mapping(raw, "paths")
+        execution = _mapping(raw, "execution")
+        _expect(model, "temperature", 0)
+        _expect(model, "thinking", "disabled")
+        _expect(execution, "mode", "standard")
+        _expect(execution, "retrieval_mode", "standard")
+        _expect(execution, "top_k", "official_default")
+        _expect(execution, "max_context_size", "official_default")
+        _expect(execution, "project_template", "general")
+        _expect(execution, "output_language", "auto")
+        _expect(execution, "chunking", "official_default")
+        _expect(execution, "persist_extracted_markdown", False)
+        _expect(execution, "vector_retrieval", True)
+        _expect(execution, "pdf_parser", "builtin")
+        _expect(execution, "image_captioning", True)
+        _expect(execution, "review_sweep_in_ingest", True)
+        _expect(execution, "qa_workers", 1)
+        _expect(execution, "judge_workers", 1)
+        cfg = cls(
+            bridge_base_url=_text(bridge, "base_url").rstrip("/"),
+            bridge_token_env=_text(bridge, "token_env"),
+            ark_api_key_env=_text(model, "api_key_env"),
+            model=_text(model, "name"),
+            model_provider=_text(model, "provider"),
+            model_base_url=_text(model, "base_url").rstrip("/"),
+            embedding_model=_text(embedding, "name"),
+            embedding_provider=_text(embedding, "provider"),
+            embedding_base_url=_text(embedding, "base_url").rstrip("/"),
+            embedding_dimensions=_integer(embedding, "dimensions"),
+            embedding_input=_text(embedding, "input"),
+            output_dir=Path(_text(paths, "output_dir")).expanduser().resolve(),
+            project_path=Path(_text(paths, "project_path")).expanduser().resolve(),
+            request_timeout_seconds=_integer(execution, "request_timeout_seconds"),
+        )
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        expected = {
+            "model": (self.model, "doubao-seed-2-0-lite-260428"),
+            "model_provider": (self.model_provider, "volcengine"),
+            "model_base_url": (
+                self.model_base_url,
+                "https://ark.cn-beijing.volces.com/api/v3",
+            ),
+            "embedding_model": (
+                self.embedding_model,
+                "doubao-embedding-vision-251215",
+            ),
+            "embedding_provider": (self.embedding_provider, "volcengine"),
+            "embedding_base_url": (
+                self.embedding_base_url,
+                "https://ark.cn-beijing.volces.com/api/v3",
+            ),
+            "embedding_dimensions": (self.embedding_dimensions, 1024),
+            "embedding_input": (self.embedding_input, "multimodal"),
+        }
+        mismatches = [
+            f"{name}={actual!r}, expected {wanted!r}"
+            for name, (actual, wanted) in expected.items()
+            if actual != wanted
+        ]
+        if mismatches:
+            raise ValueError("Invalid fixed benchmark config: " + "; ".join(mismatches))
+        if self.request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
+
+    def bridge_token(self) -> str:
+        return _required_env(self.bridge_token_env)
+
+    def ark_api_key(self) -> str:
+        return _required_env(self.ark_api_key_env)
+
+    def public_manifest(self) -> dict[str, Any]:
+        return {
+            "llmWiki": {
+                "version": "0.6.11",
+                "commit": "e8082119649e6a8e1cf85eaf289adcabfdf39d4e",
+                "mode": "standard",
+                "retrievalMode": "standard",
+                "topK": {"source": "official_default", "resolvedValue": 5},
+                "maxContextSize": {
+                    "source": "official_default",
+                    "resolvedValue": 204800,
+                    "unit": "characters",
+                },
+                "projectTemplate": "general",
+                "outputLanguage": "auto",
+                "chunking": "official_default",
+                "persistExtractedMarkdown": False,
+                "vectorRetrieval": True,
+                "imageCaptioning": True,
+                "pdfParser": "builtin",
+                "reviewSweepIncludedInIngest": True,
+            },
+            "model": {
+                "name": self.model,
+                "provider": self.model_provider,
+                "baseUrl": self.model_base_url,
+                "temperature": 0,
+                "thinking": "disabled",
+            },
+            "embedding": {
+                "name": self.embedding_model,
+                "provider": self.embedding_provider,
+                "baseUrl": self.embedding_base_url,
+                "dimensions": self.embedding_dimensions,
+                "input": self.embedding_input,
+            },
+        }
+
+
+def _mapping(parent: dict[str, Any], key: str) -> dict[str, Any]:
+    value = parent.get(key)
+    if not isinstance(value, dict):
+        raise ValueError(f"Config field {key!r} must be a mapping")
+    return value
+
+
+def _text(parent: dict[str, Any], key: str) -> str:
+    value = parent.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Config field {key!r} must be a non-empty string")
+    return value.strip()
+
+
+def _integer(parent: dict[str, Any], key: str) -> int:
+    value = parent.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Config field {key!r} must be an integer")
+    return value
+
+
+def _required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Required environment variable is not set: {name}")
+    return value
+
+
+def _expect(parent: dict[str, Any], key: str, expected: Any) -> None:
+    actual = parent.get(key)
+    if type(actual) is not type(expected) or actual != expected:
+        raise ValueError(
+            f"Fixed benchmark field {key!r} must be {expected!r}, got {actual!r}"
+        )

@@ -1,0 +1,151 @@
+diff --git a/src-tauri/src/agent/provider.rs b/src-tauri/src/agent/provider.rs
+index 37094e0..528da2c 100644
+--- a/src-tauri/src/agent/provider.rs
++++ b/src-tauri/src/agent/provider.rs
+@@ -920,6 +920,11 @@ fn is_deepseek_endpoint(config: &LlmConfig) -> bool {
+     endpoint.contains("api.deepseek.com") || endpoint.contains("api.deepseek.cn")
+ }
+ 
++fn is_volcengine_ark_endpoint(config: &LlmConfig) -> bool {
++    let endpoint = config.custom_endpoint.to_ascii_lowercase();
++    endpoint.contains(".volces.com/api/v3")
++}
++
+ fn supports_deepseek_thinking_param(config: &LlmConfig) -> bool {
+     let model = config.model.to_ascii_lowercase().replace('_', "-");
+     model.contains("deepseek-v4")
+@@ -929,6 +934,10 @@ fn apply_openai_reasoning(body: &mut Value, config: &LlmConfig) {
+     let Some(reasoning) = config.reasoning.as_ref() else {
+         return;
+     };
++    if is_volcengine_ark_endpoint(config) && reasoning.mode.as_deref() == Some("off") {
++        body["thinking"] = json!({ "type": "disabled" });
++        return;
++    }
+     if is_deepseek_endpoint(config) && supports_deepseek_thinking_param(config) {
+         if reasoning.mode.as_deref() == Some("off") {
+             body["thinking"] = json!({ "type": "disabled" });
+@@ -1288,6 +1297,21 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn volcengine_ark_structured_tasks_disable_thinking() {
++        let mut cfg = config("custom");
++        cfg.custom_endpoint = "https://ark.cn-beijing.volces.com/api/v3".to_string();
++        cfg.model = "doubao-seed-2-0-lite-260428".to_string();
++
++        let client = LlmClient::new(cfg).unwrap().structured_task_config(8_192);
++        let body = client.openai_like_body("system", "user", &[], true, false);
++
++        assert_eq!(
++            body.pointer("/thinking/type").and_then(Value::as_str),
++            Some("disabled")
++        );
++    }
++
+     #[test]
+     fn azure_gpt5_uses_max_completion_tokens() {
+         let mut cfg = config("azure");
+diff --git a/src-tauri/src/commands/search.rs b/src-tauri/src/commands/search.rs
+index f360449..b35a5ed 100644
+--- a/src-tauri/src/commands/search.rs
++++ b/src-tauri/src/commands/search.rs
+@@ -1312,8 +1312,23 @@ async fn fetch_embedding_once(
+             text.chars().take(200).collect::<String>()
+         ))
+     })?;
+-    parse_embedding_values(&data, is_google, is_doubao_multimodal)
+-        .map_err(EmbeddingFetchError::Other)
++    let values = parse_embedding_values(&data, is_google, is_doubao_multimodal)
++        .map_err(EmbeddingFetchError::Other)?;
++    if let Some(raw_expected) = cfg.output_dimensionality {
++        if !raw_expected.is_finite() || raw_expected.fract() != 0.0 || raw_expected <= 0.0 {
++            return Err(EmbeddingFetchError::Other(
++                "Embedding output dimensionality must be a positive integer".to_string(),
++            ));
++        }
++        let expected = raw_expected as usize;
++        if values.len() != expected {
++            return Err(EmbeddingFetchError::Other(format!(
++                "Embedding dimension mismatch: expected {expected}, provider returned {}",
++                values.len()
++            )));
++        }
++    }
++    Ok(values)
+ }
+ 
+ fn looks_like_oversize_error(status: u16, body: &str) -> bool {
+diff --git a/src/lib/__tests__/llm-providers.test.ts b/src/lib/__tests__/llm-providers.test.ts
+index 22d2491..73e07e6 100644
+--- a/src/lib/__tests__/llm-providers.test.ts
++++ b/src/lib/__tests__/llm-providers.test.ts
+@@ -500,6 +500,20 @@ describe("Sampling override translation across wires", () => {
+     expect(body.max_tokens).toBe(4096)
+   })
+ 
++  it("disables thinking on Volcengine Ark when reasoning is off", () => {
++    const cfg = getProviderConfig({
++      provider: "custom",
++      apiKey: "k",
++      model: "doubao-seed-2-0-lite-260428",
++      ollamaUrl: "",
++      customEndpoint: "https://ark.cn-beijing.volces.com/api/v3",
++      apiMode: "chat_completions",
++      maxContextSize: 204800,
++    })
++    expect(cfg.buildBody(baseMessages, { reasoning: { mode: "off" } }))
++      .toMatchObject({ thinking: { type: "disabled" } })
++  })
++
+   it("Anthropic maps stop → stop_sequences and respects max_tokens override", () => {
+     const cfg = getProviderConfig({
+       provider: "anthropic",
+diff --git a/src/lib/llm-providers.ts b/src/lib/llm-providers.ts
+index 2009c7f..d15631d 100644
+--- a/src/lib/llm-providers.ts
++++ b/src/lib/llm-providers.ts
+@@ -361,6 +361,10 @@ function isKimiEndpoint(config: LlmConfig): boolean {
+     || /api\.kimi\.com\/coding(?:\/|$)/i.test(config.customEndpoint)
+ }
+ 
++function isVolcengineArkEndpoint(config: LlmConfig): boolean {
++  return /ark\.cn-[a-z0-9-]+\.volces\.com\/api\/v3(?:\/|$)/i.test(config.customEndpoint)
++}
++
+ function isXiaomiMimoEndpoint(config: LlmConfig): boolean {
+   return /\.?xiaomimimo\.com(?::|\/|$)/i.test(config.customEndpoint)
+ }
+@@ -454,6 +458,7 @@ function buildOpenAiCompatibleBody(
+   streaming = true,
+ ): Record<string, unknown> {
+   assertBigModelImageSupport(config, messages)
++  const requestedReasoning = overrides?.reasoning ?? config.reasoning ?? { mode: "auto" as const }
+   const reasoning = effectiveReasoning(config, overrides)
+   const body: Record<string, unknown> = buildOpenAiBody(
+     messages,
+@@ -464,6 +469,10 @@ function buildOpenAiCompatibleBody(
+   adaptKimiBody(config, body)
+   adaptXiaomiMimoBody(config, body, reasoning)
+ 
++  if (isVolcengineArkEndpoint(config) && requestedReasoning.mode === "off") {
++    body.thinking = { type: "disabled" }
++  }
++
+   if (config.provider === "custom" && isOpenRouterEndpoint(config.customEndpoint)) {
+     if (reasoning.mode === "custom" && reasoning.budgetTokens !== undefined) {
+       body.reasoning = { max_tokens: reasoning.budgetTokens }
+diff --git a/src/stores/wiki-store.ts b/src/stores/wiki-store.ts
+index cbf64f3..61484a6 100644
+--- a/src/stores/wiki-store.ts
++++ b/src/stores/wiki-store.ts
+@@ -130,7 +130,7 @@ interface EmbeddingConfig {
+   endpoint: string // e.g. "http://127.0.0.1:1234/v1/embeddings"
+   apiKey: string
+   model: string // e.g. "text-embedding-qwen3-embedding-0.6b"
+-  /** Optional Gemini native `output_dimensionality` value. Ignored by OpenAI-compatible endpoints. */
++  /** Optional expected output dimension. Sent to Gemini and validated for every provider. */
+   outputDimensionality?: number
+   /**
+    * Chunking knobs (Phase 1 RAG). Undefined values fall back to the

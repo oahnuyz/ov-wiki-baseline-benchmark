@@ -1,0 +1,1383 @@
+diff --git a/src-tauri/src/agent/provider.rs b/src-tauri/src/agent/provider.rs
+index 528da2c..c61a11e 100644
+--- a/src-tauri/src/agent/provider.rs
++++ b/src-tauri/src/agent/provider.rs
+@@ -313,6 +313,9 @@ impl LlmClient {
+         if include_model {
+             body["model"] = Value::String(self.config.model.clone());
+         }
++        if crate::benchmark::is_active() {
++            body["temperature"] = json!(0);
++        }
+         adapt_openai_strict_completion_body(&mut body, &self.config);
+         apply_openai_reasoning(&mut body, &self.config);
+         body
+@@ -328,6 +331,7 @@ impl LlmClient {
+     ) -> Result<String, String> {
+         let body = self.openai_like_body(system, user, images, include_model, false);
+ 
++        crate::benchmark::call_started();
+         let response = self
+             .client
+             .post(url)
+@@ -346,6 +350,17 @@ impl LlmClient {
+         }
+         let parsed: Value =
+             serde_json::from_str(&text).map_err(|err| format!("Invalid LLM JSON: {err}"))?;
++        match (
++            parsed.pointer("/usage/prompt_tokens").and_then(Value::as_u64),
++            parsed
++                .pointer("/usage/completion_tokens")
++                .and_then(Value::as_u64),
++        ) {
++            (Some(input), Some(output)) => {
++                crate::benchmark::agent_call_completed(input, output)
++            }
++            _ => crate::benchmark::mark_incomplete(),
++        }
+         let content = parsed
+             .get("choices")
+             .and_then(Value::as_array)
+@@ -375,6 +390,8 @@ impl LlmClient {
+         F: FnMut(&str) + Send,
+     {
+         let body = self.openai_like_body(system, user, images, include_model, true);
++        crate::benchmark::call_started();
++        crate::benchmark::mark_incomplete();
+         let response = self
+             .client
+             .post(url)
+diff --git a/src-tauri/src/api_server.rs b/src-tauri/src/api_server.rs
+index 796c75c..563c4d6 100644
+--- a/src-tauri/src/api_server.rs
++++ b/src-tauri/src/api_server.rs
+@@ -1,4 +1,4 @@
+-use std::collections::{BTreeMap, BTreeSet, VecDeque};
++use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+ use std::fs;
+ use std::io::{Cursor, Read};
+ use std::path::{Component, Path, PathBuf};
+@@ -17,7 +17,7 @@ use uuid::Uuid;
+ use walkdir::WalkDir;
+ 
+ use crate::cors::{local_cors_headers, request_origin};
+-use crate::{agent, clip_server, commands, server_bind};
++use crate::{agent, benchmark, clip_server, commands, server_bind};
+ 
+ const PORT: u16 = 19828;
+ const API_PREFIX: &str = "/api/v1";
+@@ -47,6 +47,14 @@ static IN_FLIGHT_CHAT_STREAMS: AtomicUsize = AtomicUsize::new(0);
+ static IN_FLIGHT_PAGE_EMBEDS: AtomicUsize = AtomicUsize::new(0);
+ static APP_STATE_CACHE: OnceLock<Mutex<Option<CachedAppState>>> = OnceLock::new();
+ static RATE_LIMIT: OnceLock<Mutex<VecDeque<Instant>>> = OnceLock::new();
++static BENCHMARK_RUNS: OnceLock<Mutex<HashMap<String, BenchmarkRun>>> = OnceLock::new();
++
++#[derive(Clone)]
++struct BenchmarkRun {
++    id: String,
++    corpus_id: String,
++    project: ProjectEntry,
++}
+ 
+ #[derive(Clone)]
+ struct CachedAppState {
+@@ -191,6 +199,16 @@ fn process_request(app: AppHandle, mut request: tiny_http::Request) {
+     let method = request.method().clone();
+     let url = request.url().to_string();
+     let origin = request_origin(&request);
++    let path = split_url(&url).0;
++    if path.starts_with(&format!("{API_PREFIX}/benchmark/"))
++        && !request
++            .remote_addr()
++            .map(|address| address.ip().is_loopback())
++            .unwrap_or(false)
++    {
++        respond_error(request, 403, "Benchmark routes are loopback-only", origin.as_deref());
++        return;
++    }
+     if method == Method::Options {
+         respond_options(request, origin.as_deref());
+         return;
+@@ -366,6 +384,16 @@ fn handle_request(
+         (&Method::Post, ["projects", project_id, "chat", session_id, "cancel"]) => {
+             handle_cancel_chat(app, project_id, session_id)
+         }
++        (&Method::Post, ["benchmark", "runs"]) => handle_benchmark_create(app, body),
++        (&Method::Post, ["benchmark", "runs", run_id, "ingest"]) => {
++            handle_benchmark_ingest(app, run_id, body)
++        }
++        (&Method::Post, ["benchmark", "runs", run_id, "qa"]) => {
++            handle_benchmark_qa(app, run_id, body)
++        }
++        (&Method::Post, ["benchmark", "runs", run_id, "delete"]) => {
++            handle_benchmark_delete(app, run_id)
++        }
+         _ => err(404, "Not found"),
+     }
+ }
+@@ -413,6 +441,9 @@ fn is_token_required_request(method: &Method, path: &str) -> bool {
+     let Some(parts) = api_path_parts(path) else {
+         return false;
+     };
++    if method == &Method::Post && parts.first().copied() == Some("benchmark") {
++        return true;
++    }
+     method == &Method::Post && matches!(parts.as_slice(), ["projects", _, "pages", "embed"])
+ }
+ 
+@@ -2012,6 +2043,330 @@ fn handle_chat(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
+     }
+ }
+ 
++fn benchmark_runs() -> &'static Mutex<HashMap<String, BenchmarkRun>> {
++    BENCHMARK_RUNS.get_or_init(|| Mutex::new(HashMap::new()))
++}
++
++fn benchmark_run(run_id: &str) -> Result<BenchmarkRun, ApiResponse> {
++    benchmark_runs()
++        .lock()
++        .map_err(|_| err(500, "Benchmark run registry is unavailable"))?
++        .get(run_id)
++        .cloned()
++        .ok_or_else(|| err(404, format!("Unknown benchmark run: {run_id}")))
++}
++
++fn handle_benchmark_create(app: &AppHandle, body: &str) -> ApiResponse {
++    let mut value: Value = match serde_json::from_str(body) {
++        Ok(value) => value,
++        Err(error) => return err(400, format!("Invalid JSON: {error}")),
++    };
++    let corpus_id = value
++        .get("corpusId")
++        .and_then(Value::as_str)
++        .unwrap_or("")
++        .trim()
++        .to_string();
++    let project_path = value
++        .get("projectPath")
++        .and_then(Value::as_str)
++        .unwrap_or("")
++        .trim()
++        .to_string();
++    if corpus_id.is_empty() || project_path.is_empty() || value.get("config").is_none() {
++        return err(400, "corpusId, projectPath, and config are required");
++    }
++    let project = match resolve_project(app, &project_path) {
++        Ok(project) => project,
++        Err(error) => return err(404, error),
++    };
++    if !project.current || !project_path_matches(&project.path, &project_path) {
++        return err(409, "The dedicated benchmark project must already be open");
++    }
++    let duplicate = benchmark_runs()
++        .lock()
++        .map(|runs| {
++            runs.values()
++                .any(|run| project_path_matches(&run.project.path, &project.path))
++        })
++        .unwrap_or(true);
++    if duplicate {
++        return err(409, "An active benchmark run already owns this project");
++    }
++
++    let run_id = Uuid::new_v4().to_string();
++    value["runId"] = Value::String(run_id.clone());
++    let frontend = match benchmark::dispatch_frontend(
++        app,
++        "create",
++        value,
++        Duration::from_secs(30),
++    ) {
++        Ok(result) => result,
++        Err(error) => return err(500, error),
++    };
++    if frontend
++        .get("resolvedMaxContextSize")
++        .and_then(Value::as_u64)
++        != Some(204_800)
++    {
++        return err(500, "Frontend did not confirm maxContextSize=204800");
++    }
++    let scaffold = match frontend.get("projectScaffold") {
++        Some(value)
++            if value.get("template").and_then(Value::as_str) == Some("general")
++                && value.get("outputLanguage").and_then(Value::as_str) == Some("auto")
++                && value.get("chunking").and_then(Value::as_str)
++                    == Some("official_default")
++                && value
++                    .get("persistExtractedMarkdown")
++                    .and_then(Value::as_bool)
++                    == Some(false)
++                && value
++                    .get("fileSha256")
++                    .and_then(Value::as_object)
++                    .is_some_and(|hashes| {
++                        [
++                            "purpose.md",
++                            "schema.md",
++                            "wiki/index.md",
++                            "wiki/overview.md",
++                            "wiki/log.md",
++                        ]
++                        .iter()
++                        .all(|path| {
++                            hashes
++                                .get(*path)
++                                .and_then(Value::as_str)
++                                .is_some_and(|hash| {
++                                    hash.len() == 64
++                                        && hash.chars().all(|ch| ch.is_ascii_hexdigit())
++                                })
++                        })
++                    }) => value.clone(),
++        _ => return err(500, "Frontend did not confirm the General project scaffold"),
++    };
++    let run = BenchmarkRun {
++        id: run_id.clone(),
++        corpus_id,
++        project,
++    };
++    if let Ok(mut runs) = benchmark_runs().lock() {
++        runs.insert(run_id.clone(), run);
++    } else {
++        return err(500, "Benchmark run registry is unavailable");
++    }
++    ok(json!({
++        "runId": run_id,
++        "resolvedMaxContextSize": 204800,
++        "projectScaffold": scaffold,
++    }))
++}
++
++fn handle_benchmark_ingest(app: &AppHandle, run_id: &str, body: &str) -> ApiResponse {
++    let run = match benchmark_run(run_id) {
++        Ok(run) => run,
++        Err(response) => return response,
++    };
++    let mut value: Value = match serde_json::from_str(body) {
++        Ok(value) => value,
++        Err(error) => return err(400, format!("Invalid JSON: {error}")),
++    };
++    let documents = value.get("documents").and_then(Value::as_array);
++    if documents.map(Vec::is_empty).unwrap_or(true)
++        || documents
++            .unwrap()
++            .iter()
++            .any(|item| item.as_str().map(str::trim).unwrap_or("").is_empty())
++    {
++        return err(400, "documents must be a non-empty array of paths");
++    }
++    value["runId"] = Value::String(run.id.clone());
++    value["corpusId"] = Value::String(run.corpus_id.clone());
++    value["projectPath"] = Value::String(run.project.path.clone());
++    match benchmark::dispatch_frontend(
++        app,
++        "ingest",
++        value,
++        Duration::from_secs(24 * 60 * 60),
++    ) {
++        Ok(result) => ok(result),
++        Err(error) => err(502, error),
++    }
++}
++
++fn validate_benchmark_qa(value: &Value) -> Result<(), String> {
++    let tools = value.get("tools").and_then(Value::as_object);
++    let valid_tools = tools
++        .map(|tools| {
++            tools.get("wiki").and_then(Value::as_bool) == Some(true)
++                && tools.get("web").and_then(Value::as_bool) == Some(false)
++                && tools.get("anytxt").and_then(Value::as_bool) == Some(false)
++        })
++        .unwrap_or(false);
++    let empty_history = value
++        .get("history")
++        .and_then(Value::as_array)
++        .map(Vec::is_empty)
++        == Some(true);
++    let empty_skills = value
++        .get("skills")
++        .and_then(Value::as_array)
++        .map(Vec::is_empty)
++        == Some(true);
++    if value.get("message").and_then(Value::as_str).map(str::trim) == Some("")
++        || value.get("message").and_then(Value::as_str).is_none()
++        || value.get("sessionId").and_then(Value::as_str).map(str::trim) == Some("")
++        || value.get("sessionId").and_then(Value::as_str).is_none()
++        || value.get("mode").and_then(Value::as_str) != Some("standard")
++        || value.get("retrievalMode").and_then(Value::as_str) != Some("standard")
++        || value.get("topK").is_some()
++        || !valid_tools
++        || !empty_history
++        || value.get("historyExplicit").and_then(Value::as_bool) != Some(true)
++        || !empty_skills
++        || value.get("skillMode").and_then(Value::as_str) != Some("explicit")
++        || value.get("persistSession").and_then(Value::as_bool) != Some(false)
++    {
++        return Err("QA request violates the fixed benchmark isolation contract".to_string());
++    }
++    Ok(())
++}
++
++fn handle_benchmark_qa(app: &AppHandle, run_id: &str, body: &str) -> ApiResponse {
++    let run = match benchmark_run(run_id) {
++        Ok(run) => run,
++        Err(response) => return response,
++    };
++    let value: Value = match serde_json::from_str(body) {
++        Ok(value) => value,
++        Err(error) => return err(400, format!("Invalid JSON: {error}")),
++    };
++    if let Err(error) = validate_benchmark_qa(&value) {
++        return err(400, error);
++    }
++    let session_id = value
++        .get("sessionId")
++        .and_then(Value::as_str)
++        .unwrap_or("")
++        .to_string();
++    let stage = format!("qa:{}:{session_id}", run.id);
++    if let Err(error) = benchmark::begin(&stage) {
++        return err(409, error);
++    }
++    let started = Instant::now();
++    let response = handle_chat(app, &run.project.id, body);
++    let duration = started.elapsed().as_secs_f64();
++    let usage = match benchmark::finish(&stage) {
++        Ok(usage) => usage,
++        Err(error) => return err(500, error),
++    };
++    if response.status != 200 {
++        return response;
++    }
++    if !usage.complete {
++        return err(502, "Provider usage telemetry was incomplete during QA");
++    }
++    let answer = response
++        .body
++        .pointer("/message/content")
++        .and_then(Value::as_str)
++        .unwrap_or("");
++    if answer.trim().is_empty() {
++        return err(502, "Agent returned an empty answer");
++    }
++    ok(json!({
++        "status": "completed",
++        "answer": answer,
++        "sessionId": response.body.get("sessionId").cloned().unwrap_or(Value::Null),
++        "durationSeconds": duration,
++        "resolvedTopK": 5,
++        "usage": {
++            "inputTokens": usage.input_tokens,
++            "outputTokens": usage.output_tokens,
++            "embeddingTokens": usage.embedding_tokens,
++            "agentInputTokens": usage.agent_input_tokens,
++            "agentOutputTokens": usage.agent_output_tokens,
++            "searchInputTokens": usage.search_input_tokens,
++            "searchOutputTokens": usage.search_output_tokens,
++        },
++        "references": response.body.get("references").cloned().unwrap_or_else(|| json!([])),
++        "trace": response.body.get("events").cloned().unwrap_or_else(|| json!([])),
++    }))
++}
++
++fn remove_benchmark_path(path: &Path) -> Result<(), String> {
++    if !path.exists() {
++        return Ok(());
++    }
++    if path.is_dir() {
++        fs::remove_dir_all(path)
++    } else {
++        fs::remove_file(path)
++    }
++    .map_err(|error| format!("Failed to remove {}: {error}", path.display()))
++}
++
++fn handle_benchmark_delete(app: &AppHandle, run_id: &str) -> ApiResponse {
++    let run = match benchmark_run(run_id) {
++        Ok(run) => run,
++        Err(response) => return response,
++    };
++    let project_root = PathBuf::from(&run.project.path);
++    if !project_root.is_absolute() || project_root.parent().is_none() {
++        return err(409, "Dedicated project path is not safe for cleanup");
++    }
++    let project_record = project_root.join(".llm-wiki").join("project.json");
++    let record = match fs::read(&project_record) {
++        Ok(record) => record,
++        Err(error) => return err(409, format!("Dedicated project record is unavailable: {error}")),
++    };
++    if read_project_id(&run.project.path).as_deref() != Some(run.project.id.as_str()) {
++        return err(409, "Dedicated project identity changed; refusing cleanup");
++    }
++
++    let started = Instant::now();
++    let frontend = benchmark::dispatch_frontend(
++        app,
++        "delete",
++        json!({ "runId": run.id.clone(), "projectPath": run.project.path.clone() }),
++        Duration::from_secs(30),
++    );
++    if let Err(error) = frontend {
++        return err(500, error);
++    }
++    let cleanup_paths = vec![
++        "wiki".to_string(),
++        "media".to_string(),
++        "raw/parsed".to_string(),
++        format!("raw/sources/.benchmark-{}", run.id),
++    ];
++    for relative in cleanup_paths {
++        if let Err(error) = remove_benchmark_path(&project_root.join(relative)) {
++            return err(500, error);
++        }
++    }
++    let metadata = project_root.join(".llm-wiki");
++    if let Err(error) = remove_benchmark_path(&metadata) {
++        return err(500, error);
++    }
++    if let Err(error) = fs::create_dir_all(&metadata)
++        .and_then(|_| fs::write(metadata.join("project.json"), record))
++    {
++        return err(500, format!("Failed to restore dedicated project identity: {error}"));
++    }
++    if let Ok(mut runs) = benchmark_runs().lock() {
++        runs.remove(run_id);
++    } else {
++        return err(500, "Benchmark run registry is unavailable");
++    }
++    ok(json!({
++        "status": "completed",
++        "durationSeconds": started.elapsed().as_secs_f64(),
++        "usage": { "inputTokens": 0, "outputTokens": 0, "embeddingTokens": 0 },
++    }))
++}
++
+ struct SseReader {
+     receiver: Receiver<Vec<u8>>,
+     current: Cursor<Vec<u8>>,
+@@ -3188,6 +3543,14 @@ mod tests {
+             &Method::Post,
+             "/api/v1/projects/current/chat"
+         ));
++        assert!(is_token_required_request(
++            &Method::Post,
++            "/api/v1/benchmark/runs"
++        ));
++        assert!(is_token_required_request(
++            &Method::Post,
++            "/api/v1/benchmark/runs/example/qa"
++        ));
+         assert!(!is_token_required_request(
+             &Method::Post,
+             "/api/v1/projects/current/search"
+@@ -3198,6 +3561,26 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn benchmark_qa_contract_requires_isolated_default_retrieval() {
++        let valid = json!({
++            "message": "Question",
++            "sessionId": "unique",
++            "mode": "standard",
++            "retrievalMode": "standard",
++            "tools": { "wiki": true, "web": false, "anytxt": false },
++            "history": [],
++            "historyExplicit": true,
++            "skills": [],
++            "skillMode": "explicit",
++            "persistSession": false
++        });
++        assert!(validate_benchmark_qa(&valid).is_ok());
++        let mut with_top_k = valid;
++        with_top_k["topK"] = json!(5);
++        assert!(validate_benchmark_qa(&with_top_k).is_err());
++    }
++
+     #[test]
+     fn chat_streaming_is_enabled_by_body_or_accept_header() {
+         let path = "/api/v1/projects/current/chat";
+diff --git a/src-tauri/src/benchmark.rs b/src-tauri/src/benchmark.rs
+new file mode 100644
+index 0000000..8686559
+--- /dev/null
++++ b/src-tauri/src/benchmark.rs
+@@ -0,0 +1,186 @@
++use std::collections::HashMap;
++use std::sync::mpsc::{self, SyncSender};
++use std::sync::{Mutex, OnceLock};
++use std::time::Duration;
++
++use serde::Serialize;
++use serde_json::{json, Value};
++use tauri::{AppHandle, Emitter};
++use uuid::Uuid;
++
++#[derive(Debug, Clone, Default, Serialize)]
++#[serde(rename_all = "camelCase")]
++pub struct UsageSnapshot {
++    pub input_tokens: u64,
++    pub output_tokens: u64,
++    pub embedding_tokens: u64,
++    pub agent_input_tokens: u64,
++    pub agent_output_tokens: u64,
++    pub search_input_tokens: u64,
++    pub search_output_tokens: u64,
++    pub complete: bool,
++    pub expected_calls: u64,
++    pub completed_calls: u64,
++}
++
++#[derive(Default)]
++struct UsageState {
++    active: bool,
++    stage: String,
++    snapshot: UsageSnapshot,
++}
++
++static USAGE: OnceLock<Mutex<UsageState>> = OnceLock::new();
++static PENDING: OnceLock<Mutex<HashMap<String, SyncSender<Result<Value, String>>>>> =
++    OnceLock::new();
++
++fn usage() -> &'static Mutex<UsageState> {
++    USAGE.get_or_init(|| Mutex::new(UsageState::default()))
++}
++
++pub fn begin(stage: &str) -> Result<(), String> {
++    let mut state = usage()
++        .lock()
++        .map_err(|_| "Benchmark telemetry lock is unavailable".to_string())?;
++    if state.active {
++        return Err("Another benchmark telemetry stage is active".to_string());
++    }
++    state.active = true;
++    state.stage = stage.to_string();
++    state.snapshot = UsageSnapshot {
++        complete: true,
++        ..UsageSnapshot::default()
++    };
++    Ok(())
++}
++
++pub fn call_started() {
++    if let Ok(mut state) = usage().lock() {
++        if state.active {
++            state.snapshot.expected_calls += 1;
++        }
++    }
++}
++
++pub fn is_active() -> bool {
++    usage().lock().map(|state| state.active).unwrap_or(false)
++}
++
++pub fn agent_call_completed(prompt_tokens: u64, completion_tokens: u64) {
++    if let Ok(mut state) = usage().lock() {
++        if state.active {
++            state.snapshot.completed_calls += 1;
++            state.snapshot.input_tokens += prompt_tokens;
++            state.snapshot.output_tokens += completion_tokens;
++            state.snapshot.agent_input_tokens += prompt_tokens;
++            state.snapshot.agent_output_tokens += completion_tokens;
++        }
++    }
++}
++
++pub fn embedding_call_completed(prompt_tokens: Option<u64>) {
++    if let Ok(mut state) = usage().lock() {
++        if !state.active {
++            return;
++        }
++        state.snapshot.completed_calls += 1;
++        match prompt_tokens {
++            Some(tokens) => state.snapshot.embedding_tokens += tokens,
++            None => state.snapshot.complete = false,
++        }
++    }
++}
++
++pub fn mark_incomplete() {
++    if let Ok(mut state) = usage().lock() {
++        if state.active {
++            state.snapshot.complete = false;
++        }
++    }
++}
++
++pub fn finish(stage: &str) -> Result<UsageSnapshot, String> {
++    let mut state = usage()
++        .lock()
++        .map_err(|_| "Benchmark telemetry lock is unavailable".to_string())?;
++    if !state.active || state.stage != stage {
++        return Err(format!("Benchmark telemetry stage mismatch: expected {stage}"));
++    }
++    state.active = false;
++    if state.snapshot.expected_calls != state.snapshot.completed_calls {
++        state.snapshot.complete = false;
++    }
++    Ok(state.snapshot.clone())
++}
++
++pub fn dispatch_frontend(
++    app: &AppHandle,
++    operation: &str,
++    payload: Value,
++    timeout: Duration,
++) -> Result<Value, String> {
++    let request_id = Uuid::new_v4().to_string();
++    let (sender, receiver) = mpsc::sync_channel(1);
++    PENDING
++        .get_or_init(|| Mutex::new(HashMap::new()))
++        .lock()
++        .map_err(|_| "Benchmark bridge lock is unavailable".to_string())?
++        .insert(request_id.clone(), sender);
++    if let Err(error) = app.emit(
++        "llm-wiki://benchmark-request",
++        json!({
++            "requestId": request_id.clone(),
++            "operation": operation,
++            "payload": payload,
++        }),
++    ) {
++        if let Ok(mut pending) = PENDING.get().unwrap().lock() {
++            pending.remove(&request_id);
++        }
++        return Err(format!("Failed to dispatch benchmark request: {error}"));
++    }
++    match receiver.recv_timeout(timeout) {
++        Ok(result) => result,
++        Err(_) => {
++            if let Some(pending) = PENDING.get() {
++                if let Ok(mut pending) = pending.lock() {
++                    pending.remove(&request_id);
++                }
++            }
++            Err(format!(
++                "Benchmark frontend operation '{operation}' timed out"
++            ))
++        }
++    }
++}
++
++#[tauri::command]
++pub fn benchmark_bridge_complete(
++    request_id: String,
++    result: Option<Value>,
++    error: Option<String>,
++) -> Result<(), String> {
++    let sender = PENDING
++        .get_or_init(|| Mutex::new(HashMap::new()))
++        .lock()
++        .map_err(|_| "Benchmark bridge lock is unavailable".to_string())?
++        .remove(&request_id)
++        .ok_or_else(|| "Unknown or expired benchmark request".to_string())?;
++    let response = match error.filter(|value| !value.trim().is_empty()) {
++        Some(message) => Err(message),
++        None => Ok(result.unwrap_or(Value::Null)),
++    };
++    sender
++        .send(response)
++        .map_err(|_| "Benchmark request receiver disconnected".to_string())
++}
++
++#[tauri::command]
++pub fn benchmark_telemetry_begin(stage: String) -> Result<(), String> {
++    begin(&stage)
++}
++
++#[tauri::command]
++pub fn benchmark_telemetry_finish(stage: String) -> Result<UsageSnapshot, String> {
++    finish(&stage)
++}
+diff --git a/src-tauri/src/commands/search.rs b/src-tauri/src/commands/search.rs
+index b35a5ed..742c89c 100644
+--- a/src-tauri/src/commands/search.rs
++++ b/src-tauri/src/commands/search.rs
+@@ -1285,6 +1285,7 @@ async fn fetch_embedding_once(
+     } else {
+         json!({ "model": cfg.model, "input": text })
+     };
++    crate::benchmark::call_started();
+     let resp = req
+         .json(&body)
+         .send()
+@@ -1312,6 +1313,11 @@ async fn fetch_embedding_once(
+             text.chars().take(200).collect::<String>()
+         ))
+     })?;
++    let embedding_tokens = data
++        .pointer("/usage/prompt_tokens")
++        .and_then(Value::as_u64)
++        .or_else(|| data.pointer("/usage/total_tokens").and_then(Value::as_u64));
++    crate::benchmark::embedding_call_completed(embedding_tokens);
+     let values = parse_embedding_values(&data, is_google, is_doubao_multimodal)
+         .map_err(EmbeddingFetchError::Other)?;
+     if let Some(raw_expected) = cfg.output_dimensionality {
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 870155c..e7818e5 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -1,5 +1,6 @@
+ mod agent;
+ mod api_server;
++mod benchmark;
+ mod clip_server;
+ mod commands;
+ mod cors;
+@@ -662,6 +663,9 @@ pub fn run() {
+             clip_server_status,
+             api_server_status,
+             api_server_reload_config,
++            benchmark::benchmark_bridge_complete,
++            benchmark::benchmark_telemetry_begin,
++            benchmark::benchmark_telemetry_finish,
+             agent_start_turn,
+             agent_start_turn_stream,
+             agent_cancel_turn,
+diff --git a/src/App.tsx b/src/App.tsx
+index 071e8dd..350ae5b 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -20,6 +20,7 @@ import { WelcomeScreen } from "@/components/project/welcome-screen"
+ import { CreateProjectDialog } from "@/components/project/create-project-dialog"
+ import type { WikiProject } from "@/types/wiki"
+ import { useAppDialog } from "@/stores/app-dialog-store"
++import { installBenchmarkBridge } from "@/lib/benchmark-bridge"
+ 
+ function applyDocumentZoom(level: number) {
+   document.documentElement.style.fontSize = `${BASE_FONT_SIZE_PX * level}px`
+@@ -36,6 +37,19 @@ function App() {
+   const [showCreateDialog, setShowCreateDialog] = useState(false)
+   const [loading, setLoading] = useState(true)
+ 
++  useEffect(() => {
++    let disposed = false
++    let unlisten: (() => void) | undefined
++    void installBenchmarkBridge().then((cleanup) => {
++      if (disposed) cleanup()
++      else unlisten = cleanup
++    })
++    return () => {
++      disposed = true
++      unlisten?.()
++    }
++  }, [])
++
+   function isCurrentProject(proj: WikiProject): boolean {
+     const current = useWikiStore.getState().project
+     return current?.id === proj.id && current.path === proj.path
+diff --git a/src/lib/benchmark-bridge.ts b/src/lib/benchmark-bridge.ts
+new file mode 100644
+index 0000000..8b66955
+--- /dev/null
++++ b/src/lib/benchmark-bridge.ts
+@@ -0,0 +1,350 @@
++import { invoke } from "@tauri-apps/api/core"
++import { listen, type UnlistenFn } from "@tauri-apps/api/event"
++import { copyFile, createDirectory, listDirectory, writeFile } from "@/commands/fs"
++import { beginBenchmarkLlmTelemetry, finishBenchmarkLlmTelemetry } from "./benchmark-telemetry"
++import {
++  clearQueueState,
++  enqueueBatchAndWaitForSweep,
++  setIngestWorkerLimit,
++} from "./ingest-queue"
++import { getFileName, normalizePath } from "./path-utils"
++import {
++  saveEmbeddingConfig,
++  saveLlmConfig,
++  saveMineruConfig,
++  saveMultimodalConfig,
++  saveOutputLanguage,
++  saveProjectLlmOverride,
++  saveSearchApiConfig,
++  saveSourceWatchConfig,
++  saveTaskModelRouting,
++} from "./project-store"
++import { getTemplate } from "./templates"
++import { useWikiStore } from "@/stores/wiki-store"
++import { useReviewStore } from "@/stores/review-store"
++import { useLintStore } from "@/stores/lint-store"
++
++const MODEL = "doubao-seed-2-0-lite-260428"
++const EMBEDDING_MODEL = "doubao-embedding-vision-251215"
++const ARK_BASE = "https://ark.cn-beijing.volces.com/api/v3"
++const DEFAULT_MAX_CONTEXT_SIZE = 204800
++const GENERAL_INDEX = `# Wiki Index
++
++## Entities
++
++## Concepts
++
++## Sources
++
++## Queries
++
++## Comparisons
++
++## Synthesis
++`
++const GENERAL_OVERVIEW = `---
++type: overview
++title: Project Overview
++tags: []
++related: []
++---
++
++# Overview
++
++<!-- Provide a high-level summary of what this wiki covers and its current state. Update regularly as understanding deepens. -->
++`
++const GENERAL_LOG = "# Research Log\n"
++const GENERAL_WIKI_DIRS = [
++  "entities",
++  "concepts",
++  "sources",
++  "queries",
++  "comparisons",
++  "synthesis",
++  "media",
++]
++const GENERAL_STRUCTURAL_FILES = new Set([
++  "wiki/index.md",
++  "wiki/overview.md",
++  "wiki/log.md",
++])
++
++interface BridgeRequest {
++  requestId: string
++  operation: "create" | "ingest" | "delete"
++  payload: Record<string, unknown>
++}
++
++interface RustUsage {
++  inputTokens: number
++  outputTokens: number
++  embeddingTokens: number
++  complete: boolean
++}
++
++function requireActiveProject(projectPath: unknown) {
++  const project = useWikiStore.getState().project
++  if (!project) throw new Error("Open the dedicated benchmark project first")
++  if (normalizePath(project.path) !== normalizePath(String(projectPath ?? ""))) {
++    throw new Error("Benchmark projectPath does not match the active project")
++  }
++  return project
++}
++
++function validateManifest(config: unknown): void {
++  const value = config as Record<string, any>
++  if (
++    value?.llmWiki?.version !== "0.6.11" ||
++    value?.llmWiki?.commit !== "e8082119649e6a8e1cf85eaf289adcabfdf39d4e" ||
++    value?.llmWiki?.mode !== "standard" ||
++    value?.llmWiki?.retrievalMode !== "standard" ||
++    value?.llmWiki?.topK?.source !== "official_default" ||
++    value?.llmWiki?.topK?.resolvedValue !== 5 ||
++    value?.llmWiki?.maxContextSize?.source !== "official_default" ||
++    value?.llmWiki?.maxContextSize?.resolvedValue !== DEFAULT_MAX_CONTEXT_SIZE ||
++    value?.llmWiki?.vectorRetrieval !== true ||
++    value?.llmWiki?.imageCaptioning !== true ||
++    value?.llmWiki?.pdfParser !== "builtin" ||
++    value?.llmWiki?.reviewSweepIncludedInIngest !== true ||
++    value?.llmWiki?.projectTemplate !== "general" ||
++    value?.llmWiki?.outputLanguage !== "auto" ||
++    value?.llmWiki?.chunking !== "official_default" ||
++    value?.llmWiki?.persistExtractedMarkdown !== false ||
++    value?.model?.name !== MODEL ||
++    value?.model?.provider !== "volcengine" ||
++    value?.model?.baseUrl !== ARK_BASE ||
++    value?.model?.temperature !== 0 ||
++    value?.model?.thinking !== "disabled" ||
++    value?.embedding?.name !== EMBEDDING_MODEL ||
++    value?.embedding?.provider !== "volcengine" ||
++    value?.embedding?.baseUrl !== ARK_BASE ||
++    value?.embedding?.dimensions !== 1024 ||
++    value?.embedding?.input !== "multimodal"
++  ) {
++    throw new Error("Benchmark manifest does not match the fixed experiment configuration")
++  }
++}
++
++function flattenFiles(nodes: Awaited<ReturnType<typeof listDirectory>>): string[] {
++  const files: string[] = []
++  const visit = (items: typeof nodes) => {
++    for (const item of items) {
++      if (item.is_dir) visit(item.children ?? [])
++      else files.push(normalizePath(item.path))
++    }
++  }
++  visit(nodes)
++  return files
++}
++
++async function sha256Text(content: string): Promise<string> {
++  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(content))
++  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")
++}
++
++async function restoreGeneralScaffold(projectPath: string) {
++  const pp = normalizePath(projectPath)
++  const wikiPath = `${pp}/wiki`
++  const existing = await listDirectory(wikiPath).catch(() => [])
++  const unexpected = flattenFiles(existing).filter((path) => {
++    const relative = path.startsWith(`${pp}/`) ? path.slice(pp.length + 1) : path
++    return !GENERAL_STRUCTURAL_FILES.has(relative)
++  })
++  if (unexpected.length > 0) {
++    throw new Error(
++      `Dedicated benchmark project contains prior Wiki data: ${unexpected[0]}`,
++    )
++  }
++
++  const template = getTemplate("general")
++  const files: Record<string, string> = {
++    "purpose.md": template.purpose,
++    "schema.md": template.schema,
++    "wiki/index.md": GENERAL_INDEX,
++    "wiki/overview.md": GENERAL_OVERVIEW,
++    "wiki/log.md": GENERAL_LOG,
++  }
++  await createDirectory(wikiPath)
++  await Promise.all(GENERAL_WIKI_DIRS.map((dir) => createDirectory(`${wikiPath}/${dir}`)))
++  await Promise.all(
++    Object.entries(files).map(([relative, content]) => writeFile(`${pp}/${relative}`, content)),
++  )
++  const hashes = Object.fromEntries(
++    await Promise.all(
++      Object.entries(files).map(async ([relative, content]) => [relative, await sha256Text(content)]),
++    ),
++  )
++  return {
++    template: "general",
++    outputLanguage: "auto",
++    chunking: "official_default",
++    persistExtractedMarkdown: false,
++    fileSha256: hashes,
++  }
++}
++
++async function configureRun(payload: Record<string, unknown>) {
++  const project = requireActiveProject(payload.projectPath)
++  validateManifest(payload.config)
++  const state = useWikiStore.getState()
++  if (state.llmConfig.maxContextSize !== DEFAULT_MAX_CONTEXT_SIZE) {
++    throw new Error("Restore the official maxContextSize default (204800) before benchmarking")
++  }
++  const apiKey = state.llmConfig.apiKey.trim() || state.embeddingConfig.apiKey.trim()
++  if (!apiKey) throw new Error("Configure the Volcengine Ark API key in LLM Wiki first")
++  const projectScaffold = await restoreGeneralScaffold(project.path)
++
++  const llm = {
++    ...state.llmConfig,
++    provider: "custom" as const,
++    apiKey,
++    model: MODEL,
++    customEndpoint: ARK_BASE,
++    apiMode: "chat_completions" as const,
++    maxContextSize: state.llmConfig.maxContextSize,
++    reasoning: { mode: "off" as const },
++    ingestReasoning: { mode: "off" as const },
++    streamingEnabled: false,
++  }
++  const embedding = {
++    ...state.embeddingConfig,
++    enabled: true,
++    endpoint: ARK_BASE,
++    apiKey,
++    model: EMBEDDING_MODEL,
++    outputDimensionality: 1024,
++    maxChunkChars: undefined,
++    overlapChunkChars: undefined,
++    concurrency: 1,
++    batchSize: 1,
++  }
++  const multimodal = {
++    ...state.multimodalConfig,
++    enabled: true,
++    useMainLlm: true,
++    concurrency: 4,
++  }
++  const mineru = { ...state.mineruConfig, enabled: false }
++  const search = {
++    ...state.searchApiConfig,
++    provider: "none" as const,
++    anyTxt: { ...state.searchApiConfig.anyTxt, enabled: false },
++  }
++  const taskRouting = { chatPresetId: null, ingestPresetId: null }
++  const projectOverride = { enabled: false, presetId: null, model: "" }
++  const sourceWatch = {
++    ...state.sourceWatchConfig,
++    persistExtractedMarkdown: false,
++    ingestConcurrency: 1,
++  }
++
++  state.setLlmConfig(llm)
++  state.setEmbeddingConfig(embedding)
++  state.setMultimodalConfig(multimodal)
++  state.setMineruConfig(mineru)
++  state.setSearchApiConfig(search)
++  state.setOutputLanguage("auto")
++  state.setSourceWatchConfig(sourceWatch)
++  state.setTaskModelRouting(taskRouting)
++  state.setProjectLlmOverride(projectOverride)
++  setIngestWorkerLimit(1)
++  await Promise.all([
++    saveLlmConfig(llm),
++    saveEmbeddingConfig(embedding),
++    saveMultimodalConfig(multimodal),
++    saveMineruConfig(mineru),
++    saveSearchApiConfig(search),
++    saveOutputLanguage("auto", project.id),
++    saveSourceWatchConfig(sourceWatch, project.id),
++    saveTaskModelRouting(taskRouting),
++    saveProjectLlmOverride(project.id, projectOverride),
++  ])
++  await invoke<string>("api_server_reload_config")
++  return { resolvedMaxContextSize: DEFAULT_MAX_CONTEXT_SIZE, projectScaffold }
++}
++
++async function ingestRun(payload: Record<string, unknown>) {
++  const project = requireActiveProject(payload.projectPath)
++  const runId = String(payload.runId ?? "")
++  const documents = payload.documents
++  if (!runId || !Array.isArray(documents) || documents.length === 0) {
++    throw new Error("Benchmark ingest requires runId and at least one document")
++  }
++
++  const stagingDir = `${normalizePath(project.path)}/raw/sources/.benchmark-${runId}`
++  await createDirectory(stagingDir)
++  const staged: Array<{ sourcePath: string; folderContext: string }> = []
++  for (const [index, source] of documents.entries()) {
++    if (typeof source !== "string" || !source.trim()) {
++      throw new Error(`Invalid benchmark document at index ${index}`)
++    }
++    const name = getFileName(normalizePath(source))
++    if (!name) throw new Error(`Benchmark document has no file name: ${source}`)
++    const destination = `${stagingDir}/${String(index).padStart(5, "0")}-${name}`
++    await copyFile(source, destination)
++    staged.push({ sourcePath: destination, folderContext: "" })
++  }
++
++  const stage = `ingest:${runId}`
++  await invoke("benchmark_telemetry_begin", { stage })
++  beginBenchmarkLlmTelemetry()
++  const started = performance.now()
++  let sweepCompleted = false
++  let operationError: unknown
++  try {
++    await enqueueBatchAndWaitForSweep(project.id, staged)
++    sweepCompleted = true
++  } catch (error) {
++    operationError = error
++  }
++  const durationSeconds = (performance.now() - started) / 1000
++  const llmUsage = finishBenchmarkLlmTelemetry()
++  const rustUsage = await invoke<RustUsage>("benchmark_telemetry_finish", { stage })
++  if (operationError) throw operationError
++  if (!llmUsage.complete || !rustUsage.complete) {
++    throw new Error("Provider usage telemetry was incomplete during ingestion")
++  }
++  return {
++    status: "completed",
++    durationSeconds,
++    usage: {
++      inputTokens: llmUsage.inputTokens + rustUsage.inputTokens,
++      outputTokens: llmUsage.outputTokens + rustUsage.outputTokens,
++      embeddingTokens: rustUsage.embeddingTokens,
++    },
++    reviewSweepCompleted: sweepCompleted,
++    embeddingDimensions: 1024,
++  }
++}
++
++async function execute(request: BridgeRequest): Promise<unknown> {
++  if (request.operation === "create") return configureRun(request.payload)
++  if (request.operation === "ingest") return ingestRun(request.payload)
++  if (request.operation === "delete") {
++    requireActiveProject(request.payload.projectPath)
++    clearQueueState()
++    useReviewStore.getState().setItems([])
++    useLintStore.getState().setItems([])
++    return { cleared: true }
++  }
++  throw new Error(`Unsupported benchmark bridge operation: ${request.operation}`)
++}
++
++export async function installBenchmarkBridge(): Promise<UnlistenFn> {
++  return listen<BridgeRequest>("llm-wiki://benchmark-request", async ({ payload }) => {
++    try {
++      const result = await execute(payload)
++      await invoke("benchmark_bridge_complete", {
++        requestId: payload.requestId,
++        result,
++        error: null,
++      })
++    } catch (error) {
++      await invoke("benchmark_bridge_complete", {
++        requestId: payload.requestId,
++        result: null,
++        error: error instanceof Error ? error.message : String(error),
++      })
++    }
++  })
++}
+diff --git a/src/lib/benchmark-telemetry.test.ts b/src/lib/benchmark-telemetry.test.ts
+new file mode 100644
+index 0000000..2152de4
+--- /dev/null
++++ b/src/lib/benchmark-telemetry.test.ts
+@@ -0,0 +1,29 @@
++import { beforeEach, describe, expect, it } from "vitest"
++import {
++  beginBenchmarkLlmTelemetry,
++  benchmarkLlmCallCompleted,
++  benchmarkLlmCallStarted,
++  finishBenchmarkLlmTelemetry,
++} from "./benchmark-telemetry"
++
++describe("benchmark LLM telemetry", () => {
++  beforeEach(() => beginBenchmarkLlmTelemetry())
++
++  it("sums provider usage without estimating tokens", () => {
++    benchmarkLlmCallStarted(false)
++    benchmarkLlmCallCompleted({ usage: { prompt_tokens: 11, completion_tokens: 7 } })
++    expect(finishBenchmarkLlmTelemetry()).toEqual({
++      inputTokens: 11,
++      outputTokens: 7,
++      complete: true,
++      expectedCalls: 1,
++      completedCalls: 1,
++    })
++  })
++
++  it("marks missing provider usage incomplete", () => {
++    benchmarkLlmCallStarted(false)
++    benchmarkLlmCallCompleted({})
++    expect(finishBenchmarkLlmTelemetry().complete).toBe(false)
++  })
++})
+diff --git a/src/lib/benchmark-telemetry.ts b/src/lib/benchmark-telemetry.ts
+new file mode 100644
+index 0000000..a15b174
+--- /dev/null
++++ b/src/lib/benchmark-telemetry.ts
+@@ -0,0 +1,67 @@
++interface UsagePayload {
++  prompt_tokens?: unknown
++  completion_tokens?: unknown
++}
++
++interface TelemetrySnapshot {
++  inputTokens: number
++  outputTokens: number
++  complete: boolean
++  expectedCalls: number
++  completedCalls: number
++}
++
++let active = false
++let snapshot: TelemetrySnapshot = emptySnapshot()
++
++function emptySnapshot(): TelemetrySnapshot {
++  return {
++    inputTokens: 0,
++    outputTokens: 0,
++    complete: true,
++    expectedCalls: 0,
++    completedCalls: 0,
++  }
++}
++
++export function beginBenchmarkLlmTelemetry(): void {
++  if (active) throw new Error("Benchmark LLM telemetry is already active")
++  active = true
++  snapshot = emptySnapshot()
++}
++
++export function benchmarkLlmCallStarted(streaming: boolean): void {
++  if (!active) return
++  snapshot.expectedCalls += 1
++  if (streaming) snapshot.complete = false
++}
++
++export function isBenchmarkLlmTelemetryActive(): boolean {
++  return active
++}
++
++export function benchmarkLlmCallCompleted(payload: unknown): void {
++  if (!active) return
++  snapshot.completedCalls += 1
++  const usage = payload && typeof payload === "object"
++    ? (payload as { usage?: UsagePayload }).usage
++    : undefined
++  const input = usage?.prompt_tokens
++  const output = usage?.completion_tokens
++  if (
++    typeof input !== "number" || !Number.isInteger(input) || input < 0 ||
++    typeof output !== "number" || !Number.isInteger(output) || output < 0
++  ) {
++    snapshot.complete = false
++    return
++  }
++  snapshot.inputTokens += input
++  snapshot.outputTokens += output
++}
++
++export function finishBenchmarkLlmTelemetry(): TelemetrySnapshot {
++  if (!active) throw new Error("Benchmark LLM telemetry is not active")
++  active = false
++  if (snapshot.expectedCalls !== snapshot.completedCalls) snapshot.complete = false
++  return { ...snapshot }
++}
+diff --git a/src/lib/ingest-queue.ts b/src/lib/ingest-queue.ts
+index f166f5e..5904120 100644
+--- a/src/lib/ingest-queue.ts
++++ b/src/lib/ingest-queue.ts
+@@ -71,6 +71,27 @@ let completedSinceIdle = 0
+ // Track whether any task has been processed since the last drain.
+ // Prevents the sweep from running on every idle/no-op call.
+ let processedSinceDrain = false
++interface DrainWaiter {
++  projectId: string
++  taskIds: string[]
++  resolve: (resolvedReviews: number) => void
++  reject: (error: Error) => void
++}
++const drainWaiters: DrainWaiter[] = []
++
++function rejectFailedDrainWaiters(projectId: string): void {
++  for (const waiter of drainWaiters.filter((item) => item.projectId === projectId)) {
++    const failed = queue.find((task) =>
++      waiter.taskIds.includes(task.id) && task.status === "failed"
++    )
++    if (!failed) continue
++    const index = drainWaiters.indexOf(waiter)
++    if (index >= 0) drainWaiters.splice(index, 1)
++    waiter.reject(new Error(
++      `Benchmark ingestion failed: ${failed.error ?? failed.sourcePath}`,
++    ))
++  }
++}
+ // Abort controller for the review-sweep LLM call so switching projects
+ // cancels a long-running judgment instead of burning tokens.
+ let sweepAbortController: AbortController | null = null
+@@ -319,6 +340,19 @@ export async function enqueueBatch(
+   return ids
+ }
+ 
++/** Benchmark-only synchronization point: resolves after every queued source
++ * has completed and the automatic review sweep has finished. */
++export async function enqueueBatchAndWaitForSweep(
++  projectId: string,
++  files: Array<{ sourcePath: string; folderContext: string }>,
++): Promise<number> {
++  const taskIds = await enqueueBatch(projectId, files)
++  return new Promise<number>((resolve, reject) => {
++    drainWaiters.push({ projectId, taskIds, resolve, reject })
++    processNext(projectId)
++  })
++}
++
+ /**
+  * Persist ingest work for a project that is not currently open. No model work
+  * starts here; restoreQueue starts these marked tasks when the project is next
+@@ -936,9 +970,33 @@ async function onQueueDrained(projectId: string, projectPath: string, epoch: num
+   try {
+     const { sweepResolvedReviews } = await import("@/lib/sweep-reviews")
+     if (currentProjectId !== projectId || queueEpoch !== epoch) return
+-    await sweepResolvedReviews(projectPath, signal)
++    const resolvedReviews = await sweepResolvedReviews(projectPath, signal)
++    const matching = drainWaiters.filter((waiter) => waiter.projectId === projectId)
++    const failures = queue.filter((task) =>
++      task.projectId === projectId &&
++      task.status === "failed" &&
++      matching.some((waiter) => waiter.taskIds.includes(task.id))
++    )
++    for (const waiter of matching) {
++      const index = drainWaiters.indexOf(waiter)
++      if (index >= 0) drainWaiters.splice(index, 1)
++      if (failures.length > 0) {
++        waiter.reject(new Error(
++          `Benchmark ingestion failed for ${failures.length} source(s): ${failures[0].error ?? "unknown error"}`,
++        ))
++      } else {
++        waiter.resolve(resolvedReviews)
++      }
++    }
+   } catch (err) {
+     console.error("[Ingest Queue] Failed to load sweep-reviews:", err)
++    const error = err instanceof Error ? err : new Error(String(err))
++    for (const waiter of drainWaiters.filter((item) => item.projectId === projectId)) {
++      const index = drainWaiters.indexOf(waiter)
++      if (index >= 0) drainWaiters.splice(index, 1)
++      waiter.reject(error)
++    }
++    throw error
+   } finally {
+     if (sweepAbortController && sweepAbortController.signal === signal) {
+       sweepAbortController = null
+@@ -1124,9 +1182,13 @@ async function processNext(projectId: string): Promise<void> {
+     )
+     if (activeRuns.size === 0 && !hasRunnablePending && !hasRestoredPending) {
+       const pathAtDrain = currentProjectPath
+-      onQueueDrained(projectId, pathAtDrain, epoch).catch((err) =>
+-        console.error("[Ingest Queue] sweep failed:", err)
+-      )
++      if (processedSinceDrain) {
++        onQueueDrained(projectId, pathAtDrain, epoch).catch((err) =>
++          console.error("[Ingest Queue] sweep failed:", err)
++        )
++      } else {
++        rejectFailedDrainWaiters(projectId)
++      }
+     }
+   } finally {
+     scheduling = false
+diff --git a/src/lib/llm-client.ts b/src/lib/llm-client.ts
+index 5e0cd51..f491bd4 100644
+--- a/src/lib/llm-client.ts
++++ b/src/lib/llm-client.ts
+@@ -3,6 +3,11 @@ import { isAzureOpenAiEndpoint } from "@/lib/azure-openai"
+ import { getProviderConfig, type RequestOverrides } from "./llm-providers"
+ import { getHttpFetch, isFetchNetworkError } from "./tauri-fetch"
+ import { countReasoningCharsInLine, extractReasoningTextFromLine } from "./reasoning-detector"
++import {
++  benchmarkLlmCallCompleted,
++  benchmarkLlmCallStarted,
++  isBenchmarkLlmTelemetryActive,
++} from "./benchmark-telemetry"
+ 
+ export type { ChatMessage, ContentBlock, RequestOverrides } from "./llm-providers"
+ export { isFetchNetworkError } from "./tauri-fetch"
+@@ -201,6 +206,10 @@ export async function streamChat(
+     )
+   }
+ 
++  const benchmarkActive = isBenchmarkLlmTelemetryActive()
++  const effectiveOverrides = benchmarkActive
++    ? { ...requestOverrides, temperature: 0, reasoning: { mode: "off" as const } }
++    : requestOverrides
+   const providerConfig = getProviderConfig(config)
+ 
+   // Combined abort: (a) user cancel, (b) our long-horizon timeout.
+@@ -233,8 +242,9 @@ export async function streamChat(
+ 
+   let response: Response
+   try {
+-    const body = providerConfig.buildBody(messages, requestOverrides)
++    const body = providerConfig.buildBody(messages, effectiveOverrides)
+     const httpFetch = await getHttpFetch()
++    benchmarkLlmCallStarted(providerConfig.streaming)
+     response = await httpFetch(providerConfig.url, {
+       method: "POST",
+       headers: providerConfig.headers,
+@@ -306,6 +316,7 @@ export async function streamChat(
+   if (!providerConfig.streaming) {
+     try {
+       const payload: unknown = await response.json()
++      benchmarkLlmCallCompleted(payload)
+       const content = providerConfig.parseResponse(payload)
+       if (!content) {
+         onError(new Error("Model returned an empty non-streaming response"))

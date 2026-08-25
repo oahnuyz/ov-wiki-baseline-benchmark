@@ -133,8 +133,22 @@ data/
 
 ```text
 Answer this question as briefly as possible. Use only the information available in the database. Do not use any external source.
+
 Question: {question}
 ```
+
+### Nashsu LLM Wiki baseline 分支
+
+`nashsu_llm_wiki` 分支增加了面向 LLM Wiki `0.6.11`（固定 commit
+`e8082119649e6a8e1cf85eaf289adcabfdf39d4e`）的严格三轮实验编排器。
+
+编排器按标准化 corpus 哈希自动分组：共享同一 corpus 的变体只入库一次，
+分别执行 QA/Judge，最后只删除一次。所有计入指标的 token 必须来自 provider
+返回的真实 usage；任何缺失字段都会令实验失败，不使用字符数估算。LLM Wiki
+fork 需要实现的接口见
+[`patches/llm_wiki/bridge_contract.md`](patches/llm_wiki/bridge_contract.md)，实际实现位于
+[`patches/llm_wiki/`](patches/llm_wiki/) 的两个顺序补丁中。`paths.project_path`
+指向一个已经打开的专用 LLM Wiki 项目；不同 corpus 组之间会完整清理并复用该项目。
 
 ### 2. 通用 0–4 分 LLM Judge
 
