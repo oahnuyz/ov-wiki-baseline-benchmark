@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 from pathlib import Path
 
@@ -23,6 +24,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def interrupt_on_sigterm(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt("Benchmark interrupted by SIGTERM")
+
+    signal.signal(signal.SIGTERM, interrupt_on_sigterm)
     args = build_parser().parse_args(argv)
     try:
         specs = load_specs()
@@ -44,9 +51,14 @@ def main(argv: list[str] | None = None) -> int:
         for group in group_prepared_experiments(prepared):
             runner.run_group(group)
         return 0
+    except KeyboardInterrupt as exc:
+        print(f"Interrupted: {exc}", file=sys.stderr)
+        return 130
     except (OSError, ValueError, RuntimeError, KeyError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

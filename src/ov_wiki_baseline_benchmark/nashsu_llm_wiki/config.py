@@ -29,8 +29,11 @@ class BenchmarkConfig:
     startup_timeout_seconds: int
     request_timeout_seconds: int
     ingest_batch_size: int = 25
+    max_batch_retries: int = 2
     restart_between_ingest_batches: bool = True
     service_restart_command: tuple[str, ...] = ()
+    service_stop_command: tuple[str, ...] = ()
+    snapshot_root: Path = Path("/tmp/ov-wiki-benchmark-snapshots")
 
     @classmethod
     def from_yaml(cls, path: Path) -> "BenchmarkConfig":
@@ -76,10 +79,13 @@ class BenchmarkConfig:
             startup_timeout_seconds=_integer(execution, "startup_timeout_seconds"),
             request_timeout_seconds=_integer(execution, "request_timeout_seconds"),
             ingest_batch_size=_optional_integer(execution, "ingest_batch_size", 25),
+            max_batch_retries=_optional_integer(execution, "max_batch_retries", 2),
             restart_between_ingest_batches=_optional_boolean(
                 execution, "restart_between_ingest_batches", True
             ),
             service_restart_command=_command(execution.get("service_restart_command")),
+            service_stop_command=_command(execution.get("service_stop_command")),
+            snapshot_root=Path(_text(paths, "snapshot_root")).expanduser().resolve(),
         )
         cfg.validate()
         return cfg
@@ -115,11 +121,17 @@ class BenchmarkConfig:
             raise ValueError("startup and request timeouts must be positive")
         if self.ingest_batch_size <= 0:
             raise ValueError("ingest_batch_size must be positive")
+        if self.max_batch_retries < 0:
+            raise ValueError("max_batch_retries must be non-negative")
         if self.restart_between_ingest_batches and not self.service_restart_command:
             raise ValueError(
                 "service_restart_command is required when "
                 "restart_between_ingest_batches=true"
             )
+        if not self.service_stop_command:
+            raise ValueError("service_stop_command is required for snapshot restoration")
+        if self.snapshot_root == self.project_path or self.snapshot_root in self.project_path.parents:
+            raise ValueError("snapshot_root must be outside project_path")
 
     def bridge_token(self) -> str:
         return _required_env(self.bridge_token_env)
@@ -150,6 +162,7 @@ class BenchmarkConfig:
                 "reviewSweepIncludedInIngest": True,
                 "ingestConcurrency": 1,
                 "ingestBatchSize": self.ingest_batch_size,
+                "maxBatchRetries": self.max_batch_retries,
                 "restartBetweenIngestBatches": self.restart_between_ingest_batches,
             },
             "model": {

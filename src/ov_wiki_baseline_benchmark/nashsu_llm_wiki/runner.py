@@ -13,11 +13,12 @@ from typing import Any, Protocol
 from ..io import load_jsonl
 from ..schema import validate_documents, validate_qas
 from ..specs import ExperimentSpec
-from .client import LlmWikiBridgeClient
+from .client import BridgeRequestError, LlmWikiBridgeClient
 from .config import BenchmarkConfig
 from .judge import ArkJudge, JudgeResult
 from .metrics import is_refusal, max_token_f1
 from .models import QaResult, RunInfo, StageResult, TokenUsage
+from .snapshots import ProjectSnapshotManager
 
 
 class Bridge(Protocol):
@@ -38,6 +39,7 @@ class Bridge(Protocol):
         final_batch: bool = True,
     ) -> StageResult: ...
     def restart_service(self, project_path: Path) -> None: ...
+    def stop_service(self) -> None: ...
     def answer(self, run_id: str, *, prompt: str, session_id: str) -> QaResult: ...
     def delete(self, run_id: str) -> StageResult: ...
 
@@ -86,6 +88,10 @@ class BenchmarkRunner:
         self.answer_prompt = answer_prompt_path.read_text(encoding="utf-8")
         _validate_answer_prompt(self.answer_prompt)
         self.bridge = bridge or LlmWikiBridgeClient(config)
+        self.snapshots = ProjectSnapshotManager(
+            project_path=config.project_path,
+            snapshot_root=config.snapshot_root,
+        )
         self.judge = judge or ArkJudge(
             api_key=config.ark_api_key(),
             base_url=config.model_base_url,
@@ -109,6 +115,7 @@ class BenchmarkRunner:
         # Reuse one already-open dedicated project. Each corpus group is fully
         # deleted before the next group, so no project switching is needed.
         project_path = self.config.project_path
+        stale_cleanup = self.snapshots.cleanup_all().duration_seconds
         self.bridge.wait_until_ready(project_path)
         run = self.bridge.create_run(corpus_id=corpus_id, project_path=project_path)
         run_id = run.run_id
@@ -120,35 +127,46 @@ class BenchmarkRunner:
             "experiments": [experiment.spec.id for experiment in experiments],
             "config": self.config.public_manifest(),
             "project_scaffold": dict(run.project_scaffold),
+            "snapshot_audit": {
+                "stale_cleanup_seconds": stale_cleanup,
+                "excluded_from_primary_metrics": True,
+                "excluded_from_deletion_metrics": True,
+            },
             "status": "created",
         }
         self._write_group_manifest(corpus_id, group_manifest)
+        try:
+            ingestion, run_id, run_ids = self._run_ingest_batches(
+                canonical,
+                corpus_id=corpus_id,
+                initial_run=run,
+                group_manifest=group_manifest,
+            )
+            group_manifest["status"] = "ingested"
+            group_manifest["run_id"] = run_id
+            group_manifest["run_ids"] = run_ids
+            group_manifest["ingestion"] = _stage_dict(ingestion)
+            self._write_group_manifest(corpus_id, group_manifest)
 
-        ingestion, run_id, run_ids = self._run_ingest_batches(
-            canonical,
-            corpus_id=corpus_id,
-            initial_run=run,
-            group_manifest=group_manifest,
-        )
-        group_manifest["status"] = "ingested"
-        group_manifest["run_id"] = run_id
-        group_manifest["run_ids"] = run_ids
-        group_manifest["ingestion"] = _stage_dict(ingestion)
-        self._write_group_manifest(corpus_id, group_manifest)
+            completed: list[tuple[PreparedExperiment, list[dict[str, Any]]]] = []
+            for experiment in experiments:
+                records = self._run_qa(experiment, run_id, ingestion)
+                self._run_judge(experiment, records, ingestion)
+                completed.append((experiment, records))
 
-        completed: list[tuple[PreparedExperiment, list[dict[str, Any]]]] = []
-        for experiment in experiments:
-            records = self._run_qa(experiment, run_id, ingestion)
-            self._run_judge(experiment, records, ingestion)
-            completed.append((experiment, records))
-
-        deletion = self.bridge.delete(run_id)
-        for experiment, records in completed:
-            self._write_final_report(experiment, records, ingestion, deletion)
-        group_manifest["status"] = "completed"
-        group_manifest["deletion"] = _stage_dict(deletion)
-        self._write_group_manifest(corpus_id, group_manifest)
-        return group_manifest
+            deletion = self.bridge.delete(run_id)
+            for experiment, records in completed:
+                self._write_final_report(experiment, records, ingestion, deletion)
+            group_manifest["status"] = "completed"
+            group_manifest["deletion"] = _stage_dict(deletion)
+            self._write_group_manifest(corpus_id, group_manifest)
+            return group_manifest
+        except BaseException:
+            try:
+                self.bridge.stop_service()
+            finally:
+                self.snapshots.cleanup_all()
+            raise
 
     def _run_ingest_batches(
         self,
@@ -173,6 +191,14 @@ class BenchmarkRunner:
         run = initial_run
         run_ids = [run.run_id]
         restart_count = 0
+        planned_restart_count = 0
+        retry_restart_count = 0
+        batch_retry_count = 0
+        discarded_retry_seconds = 0.0
+        snapshot_creation_seconds = 0.0
+        snapshot_restore_seconds = 0.0
+        snapshot_cleanup_seconds = 0.0
+        retry_records: list[dict[str, Any]] = []
         operational_started = time.monotonic()
 
         for batch_index, batch in enumerate(batches):
@@ -189,12 +215,60 @@ class BenchmarkRunner:
             }
             self._write_group_manifest(corpus_id, group_manifest)
 
-            result = self.bridge.ingest(
-                run.run_id,
-                batch,
-                document_offset=offset,
-                final_batch=final_batch,
-            )
+            snapshot_creation_seconds += self.snapshots.create(
+                corpus_id, batch_index
+            ).duration_seconds
+            attempt = 0
+            try:
+                while True:
+                    attempt_started = time.monotonic()
+                    try:
+                        result = self.bridge.ingest(
+                            run.run_id,
+                            batch,
+                            document_offset=offset,
+                            final_batch=final_batch,
+                        )
+                        break
+                    except BridgeRequestError as exc:
+                        failed_seconds = time.monotonic() - attempt_started
+                        retryable = exc.retryable_transport_failure
+                        retry_record = {
+                            "batch_index": batch_index,
+                            "attempt": attempt + 1,
+                            "run_id": run.run_id,
+                            "duration_seconds": failed_seconds,
+                            "token_usage": None,
+                            "token_usage_complete": False,
+                            "retryable": retryable,
+                            "error": exc.detail,
+                            "excluded_from_primary_metrics": True,
+                        }
+                        retry_records.append(retry_record)
+                        group_manifest["discarded_ingest_attempts"] = list(retry_records)
+                        self._write_group_manifest(corpus_id, group_manifest)
+                        if not retryable or attempt >= self.config.max_batch_retries:
+                            raise
+                        discarded_retry_seconds += failed_seconds
+                        batch_retry_count += 1
+                        attempt += 1
+                        self.bridge.stop_service()
+                        snapshot_restore_seconds += self.snapshots.restore(
+                            corpus_id, batch_index
+                        ).duration_seconds
+                        self.bridge.restart_service(self.config.project_path)
+                        restart_count += 1
+                        retry_restart_count += 1
+                        run = self.bridge.create_run(
+                            corpus_id=corpus_id,
+                            project_path=self.config.project_path,
+                            continuation=True,
+                        )
+                        run_ids.append(run.run_id)
+            finally:
+                snapshot_cleanup_seconds += self.snapshots.delete_batch(
+                    corpus_id, batch_index
+                ).duration_seconds
             active_seconds += result.duration_seconds
             usage = usage + result.usage
             batch_record = {
@@ -203,6 +277,8 @@ class BenchmarkRunner:
                 "document_offset": offset,
                 "document_count": len(batch),
                 "final_batch": final_batch,
+                "attempt_count": attempt + 1,
+                "retry_count": attempt,
                 **_stage_dict(result),
             }
             batch_records.append(batch_record)
@@ -220,6 +296,7 @@ class BenchmarkRunner:
             if not final_batch and self.config.restart_between_ingest_batches:
                 self.bridge.restart_service(self.config.project_path)
                 restart_count += 1
+                planned_restart_count += 1
                 run = self.bridge.create_run(
                     corpus_id=corpus_id,
                     project_path=self.config.project_path,
@@ -236,8 +313,18 @@ class BenchmarkRunner:
             "batchSize": batch_size,
             "batchCount": len(batches),
             "restartCount": restart_count,
+            "plannedRestartCount": planned_restart_count,
+            "retryRestartCount": retry_restart_count,
+            "batchRetryCount": batch_retry_count,
+            "discardedRetryTimeSeconds": discarded_retry_seconds,
+            "discardedRetryTokenUsage": None,
+            "discardedRetryTokenUsageComplete": False if retry_records else True,
+            "snapshotCreationTimeSeconds": snapshot_creation_seconds,
+            "snapshotRestoreTimeSeconds": snapshot_restore_seconds,
+            "snapshotCleanupTimeSeconds": snapshot_cleanup_seconds,
             "operationalWallClockSeconds": operational_seconds,
             "batches": batch_records,
+            "discardedAttempts": retry_records,
         }
         return StageResult(active_seconds, usage, payload), run.run_id, run_ids
 
@@ -419,6 +506,33 @@ class BenchmarkRunner:
                 "Ingest Batch Size": ingestion.payload.get("batchSize", 0),
                 "Ingest Batch Count": ingestion.payload.get("batchCount", 1),
                 "WebKit Restart Count": ingestion.payload.get("restartCount", 0),
+                "Planned WebKit Restart Count": ingestion.payload.get(
+                    "plannedRestartCount", 0
+                ),
+                "Retry WebKit Restart Count": ingestion.payload.get(
+                    "retryRestartCount", 0
+                ),
+                "Batch Retry Count": ingestion.payload.get("batchRetryCount", 0),
+                "Discarded Retry Time (s)": ingestion.payload.get(
+                    "discardedRetryTimeSeconds", 0.0
+                ),
+                "Discarded Retry Token Usage": ingestion.payload.get(
+                    "discardedRetryTokenUsage"
+                ),
+                "Discarded Retry Token Usage Complete": ingestion.payload.get(
+                    "discardedRetryTokenUsageComplete", True
+                ),
+                "Snapshot Creation Time (s)": ingestion.payload.get(
+                    "snapshotCreationTimeSeconds", 0.0
+                ),
+                "Snapshot Restore Time (s)": ingestion.payload.get(
+                    "snapshotRestoreTimeSeconds", 0.0
+                ),
+                "Snapshot Cleanup Time (s)": ingestion.payload.get(
+                    "snapshotCleanupTimeSeconds", 0.0
+                ),
+                "Snapshot Costs Included In Primary Metrics": False,
+                "Snapshot Cleanup Included In Deletion Time": False,
                 "Ingest Concurrency": 1,
             },
             "Query Efficiency (Average Per Query)": {
@@ -509,6 +623,15 @@ def _stage_dict(stage: StageResult) -> dict[str, Any]:
         "batchCount": "batch_count",
         "restartCount": "restart_count",
         "reviewSweepCount": "review_sweep_count",
+        "plannedRestartCount": "planned_restart_count",
+        "retryRestartCount": "retry_restart_count",
+        "batchRetryCount": "batch_retry_count",
+        "discardedRetryTimeSeconds": "discarded_retry_time_seconds",
+        "discardedRetryTokenUsage": "discarded_retry_token_usage",
+        "discardedRetryTokenUsageComplete": "discarded_retry_token_usage_complete",
+        "snapshotCreationTimeSeconds": "snapshot_creation_time_seconds",
+        "snapshotRestoreTimeSeconds": "snapshot_restore_time_seconds",
+        "snapshotCleanupTimeSeconds": "snapshot_cleanup_time_seconds",
     }
     for wire_name, report_name in wire_names.items():
         if wire_name in stage.payload:

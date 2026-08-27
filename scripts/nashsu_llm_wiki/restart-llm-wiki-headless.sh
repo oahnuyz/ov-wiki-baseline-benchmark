@@ -14,20 +14,7 @@ log_file="$deploy_root/logs/llm-wiki-headless.log"
 
 mkdir -p "$runtime_dir" "$deploy_root/logs"
 
-if [[ -f "$pid_file" ]]; then
-  old_pid="$(tr -dc '0-9' <"$pid_file")"
-  if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-    kill -TERM -- "-$old_pid" 2>/dev/null || kill -TERM "$old_pid" 2>/dev/null || true
-    for _ in $(seq 1 50); do
-      kill -0 "$old_pid" 2>/dev/null || break
-      sleep 0.2
-    done
-    if kill -0 "$old_pid" 2>/dev/null; then
-      printf 'LLM Wiki service did not stop cleanly: pid=%s\n' "$old_pid" >&2
-      exit 1
-    fi
-  fi
-fi
+"$deploy_root/tools/stop-llm-wiki-headless.sh"
 
 nohup setsid "$launcher" >>"$log_file" 2>&1 </dev/null &
 new_pid=$!

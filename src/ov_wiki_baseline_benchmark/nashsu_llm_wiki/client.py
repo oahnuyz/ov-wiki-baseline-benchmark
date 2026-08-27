@@ -13,6 +13,32 @@ from .config import BenchmarkConfig
 from .models import QaResult, RunInfo, StageResult
 
 
+class BridgeRequestError(RuntimeError):
+    def __init__(self, *, status_code: int | None, detail: str) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(
+            f"LLM Wiki bridge request failed"
+            f"{f' with HTTP {status_code}' if status_code is not None else ''}: {detail}"
+        )
+
+    @property
+    def retryable_transport_failure(self) -> bool:
+        lowered = self.detail.lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "error sending request",
+                "connection reset",
+                "connection refused",
+                "connection closed",
+                "temporarily unavailable",
+                "timed out",
+                "timeout",
+            )
+        )
+
+
 class LlmWikiBridgeClient:
     def __init__(self, config: BenchmarkConfig) -> None:
         self.config = config
@@ -117,6 +143,19 @@ class LlmWikiBridgeClient:
             raise RuntimeError(f"Failed to restart LLM Wiki service: {exc}") from exc
         self.wait_until_ready(project_path)
 
+    def stop_service(self) -> None:
+        command = self.config.service_stop_command
+        if not command:
+            raise RuntimeError("No service_stop_command is configured")
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                timeout=self.config.startup_timeout_seconds,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"Failed to stop LLM Wiki service: {exc}") from exc
+
     def answer(self, run_id: str, *, prompt: str, session_id: str) -> QaResult:
         value = self._request(
             "POST",
@@ -144,14 +183,25 @@ class LlmWikiBridgeClient:
         return stage
 
     def _request(self, method: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        response = requests.request(
-            method,
-            f"{self.base_url}{path}",
-            headers=self.headers,
-            json=body,
-            timeout=self.config.request_timeout_seconds,
-        )
-        response.raise_for_status()
+        try:
+            response = requests.request(
+                method,
+                f"{self.base_url}{path}",
+                headers=self.headers,
+                json=body,
+                timeout=self.config.request_timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise BridgeRequestError(status_code=None, detail=str(exc)) from exc
+        if not response.ok:
+            detail = response.text.strip() or response.reason
+            try:
+                error_body = response.json()
+                if isinstance(error_body, dict) and isinstance(error_body.get("error"), str):
+                    detail = error_body["error"]
+            except ValueError:
+                pass
+            raise BridgeRequestError(status_code=response.status_code, detail=detail)
         value = response.json()
         if not isinstance(value, dict):
             raise RuntimeError(f"Bridge returned non-object JSON for {path}")

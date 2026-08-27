@@ -150,6 +150,8 @@ fork 需要实现的接口见
 [`patches/llm_wiki/`](patches/llm_wiki/) 的四个顺序补丁中。`paths.project_path`
 指向一个专用 LLM Wiki 项目。benchmark headless 模式下，隐藏 WebView 会自动初始化并打开
 该项目；runner 在开始前等待鉴权 readiness 接口，不同 corpus 组之间会完整清理并复用项目。
+入库使用项目外的批次快照：可重试网络错误会恢复并整批重跑，失败尝试与快照维护成本不进入
+主要入库/删除指标，而是作为审计字段单独报告。
 
 ### 2. 通用 0–4 分 LLM Judge
 

@@ -24,8 +24,11 @@ class ConfigTests(unittest.TestCase):
         self.assertIs(manifest["llmWiki"]["persistExtractedMarkdown"], False)
         self.assertEqual(manifest["llmWiki"]["ingestConcurrency"], 1)
         self.assertEqual(manifest["llmWiki"]["ingestBatchSize"], 25)
+        self.assertEqual(manifest["llmWiki"]["maxBatchRetries"], 2)
         self.assertTrue(manifest["llmWiki"]["restartBetweenIngestBatches"])
         self.assertTrue(config.service_restart_command)
+        self.assertTrue(config.service_stop_command)
+        self.assertTrue(str(config.snapshot_root).endswith("/nashsu-llm-wiki-baseline/snapshots"))
         self.assertEqual(config.startup_timeout_seconds, 300)
         self.assertTrue(
             str(config.project_path).endswith(

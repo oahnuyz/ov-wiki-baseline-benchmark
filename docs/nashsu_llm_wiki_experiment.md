@@ -168,6 +168,8 @@ runner 将一个实验全部文档的 `sha256` 排序后串联，再计算 corpu
 | ingest worker | 1–5 | `1` | corpus 文档串行处理，避免上下文和计时相互污染 |
 | 入库批大小 | 正整数 | `25` 篇 | 每批保持同一知识库，批间重启 WebKit 服务以释放进程 mappings |
 | 批间服务重启 | 开/关 | 开 | 非最终批完成后自动重启；最终批完成后不重启，直接进入 QA |
+| 网络失败批次重试 | 非负整数 | 最多 `2` 次 | Nashsu 内部重试耗尽后，恢复批前快照并整批重跑 |
+| 批次快照目录 | 项目外路径 | `~/nashsu-llm-wiki-baseline/snapshots` | 不参与检索，正常/失败/中止时清理 |
 | QA worker | 可并行 | `1` | 逐题串行 |
 | Judge worker | 可并行 | `1` | 逐题串行，与参考 baseline 对齐 |
 | PDF 解析 | 内置 / MinerU Cloud / MinerU Local | 内置 | MinerU 强制关闭 |
@@ -293,6 +295,12 @@ corpus 的续批 run。续批接口会校验 `purpose.md`、`schema.md` 和 `ove
 编辑的 General 默认文件，并保留前批生成的 Wiki 页面、索引、向量库、review 和 ingest cache。
 因此这是进程资源的分段释放，不是知识库清空或断点跳过。
 
+每批开始前，runner 在项目目录之外创建完整项目快照。如果 Nashsu 内部最多 3 次任务重试
+仍因网络发送错误、连接中断或 timeout 耗尽，runner 会停止整个服务、恢复到该批开始前的
+快照、重启服务并整批重跑，最多额外重跑 2 次。配置、解析、维度、telemetry 等非网络错误
+不自动重跑。恢复整个批次可保证失败尝试留下的 caption cache、Wiki 文件、review、索引或
+LanceDB 写入不会被下一次尝试复用。
+
 ### 7.2 串行队列与解析
 
 所有文档进入 Nashsu 的持久化 ingest queue，worker 固定为 1。每个任务执行：
@@ -407,6 +415,12 @@ LLM sweep 每批最多 40 个 review，最多 5 批；prompt 最多列出 300 �
 实际墙钟时间，包含批间重启与 readiness 等待。这样既保持原 baseline 的入库计时边界，又
 透明记录为规避 WebKit mappings 上限而付出的运行开销。
 
+若某批发生自动回滚，主指标只累加该批最终成功尝试的 `durationSeconds` 和真实 provider
+usage；被回滚尝试的时间和 token 不进入 `Total Insertion Time` 或
+`Total Insertion Token Cost`。其墙钟耗时、错误、run ID、usage 是否可得会写入
+`discarded_ingest_attempts`。网络错误没有 provider 响应时，失败尝试 token 记为
+`null / usage_complete=false`，不估算为 0。快照创建、恢复和清理时间也只进入审计字段。
+
 ### 7.7 入库 token
 
 入库 usage 累加计时区间内所有 provider 返回的：
@@ -416,9 +430,10 @@ LLM sweep 每批最多 40 个 review，最多 5 批；prompt 最多列出 300 �
 - embedding tokens：所有页面 chunk embedding 调用。
 
 不使用字符数估算。任何已发出的模型/embedding 请求如果没有可解析的 usage，整个入库请求
-标记为 telemetry incomplete，并使 benchmark 失败。bridge 没有额外添加重试；Nashsu 原生
-ingest queue 仍保留最多 3 次任务重试和 embedding oversize 缩半重试。若发生这些重试，
-计时包含重试耗时，telemetry 的 fail-closed 检查也不会把失败调用静默忽略。
+标记为 telemetry incomplete，并使 benchmark 失败。Nashsu 原生 ingest queue 仍保留最多
+3 次任务重试和 embedding oversize 缩半重试；这些内部重试属于一次批次尝试，若最终成功，
+其时间和可报告 usage 均计入该成功尝试。如果内部重试最终因可重试网络错误耗尽，则由外层
+快照机制回滚整批，并从主要指标中排除整个失败批次尝试。
 
 ## 8. 第二轮：QA 问答轮
 
@@ -683,6 +698,10 @@ Total Insertion Token Cost
 `Includes Review Sweep=true` 和 `Review Sweep Count=1`。以 PaperScope 93 篇为例，默认形成
 25/25/25/18 四批，批间重启 3 次，最终只 sweep 1 次。
 
+发生回滚时还记录 `Batch Retry Count`、`Discarded Retry Time`、失败 usage 可用性、
+`Snapshot Creation/Restore/Cleanup Time` 和计划/重试两类重启次数。这些审计字段均不进入
+主要入库指标。
+
 ### 11.5 QA 效率
 
 令单题端到端时间为 `t_i`，单题三类 token 为 `I_i/O_i/E_i`：
@@ -707,6 +726,10 @@ Total QA Token Cost
 Total Deletion Time = 清除前端状态和全部本轮持久化数据的墙钟时间
 Total Deletion Token Cost = 0
 ```
+
+删除计时只覆盖活动 Nashsu 项目的正式清理。批次快照位于项目外，且通常在每批最终成功后
+立即删除；异常退出遗留的快照会在下次运行开始前清理。所有快照清理都发生在删除指标计时
+之外，其耗时只记为 `Snapshot Cleanup Time`，不进入 `Total Deletion Time`。
 
 ## 12. 输出文件
 

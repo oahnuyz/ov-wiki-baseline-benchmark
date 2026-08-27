@@ -146,7 +146,10 @@ the fork interface and apply all four patches in [`patches/llm_wiki/`](patches/l
 `paths.project_path` is one dedicated LLM Wiki project. In benchmark headless
 mode the hidden WebView initializes and opens it automatically; the runner waits
 for the authenticated readiness endpoint before starting and fully cleans and
-reuses the project between corpus groups.
+reuses the project between corpus groups. Ingestion uses out-of-project batch
+snapshots: retryable transport failures restore and rerun the whole batch, while
+discarded attempts and snapshot maintenance remain outside the primary insertion
+and deletion metrics and are reported separately for audit.
 
 ### Generic 0–4 LLM judge
 

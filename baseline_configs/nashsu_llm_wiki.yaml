@@ -33,12 +33,16 @@ execution:
   qa_workers: 1
   judge_workers: 1
   ingest_batch_size: 25
+  max_batch_retries: 2
   restart_between_ingest_batches: true
   service_restart_command:
     - "/home/ZhangYunhao/nashsu-llm-wiki-baseline/tools/restart-llm-wiki-headless.sh"
+  service_stop_command:
+    - "/home/ZhangYunhao/nashsu-llm-wiki-baseline/tools/stop-llm-wiki-headless.sh"
   startup_timeout_seconds: 300
   request_timeout_seconds: 129600
 
 paths:
   output_dir: "~/nashsu-llm-wiki-baseline/results"
   project_path: "~/nashsu-llm-wiki-baseline/project"
+  snapshot_root: "~/nashsu-llm-wiki-baseline/snapshots"

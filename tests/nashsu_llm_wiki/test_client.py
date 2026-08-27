@@ -6,7 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from ov_wiki_baseline_benchmark.nashsu_llm_wiki.client import LlmWikiBridgeClient
+from ov_wiki_baseline_benchmark.nashsu_llm_wiki.client import (
+    BridgeRequestError,
+    LlmWikiBridgeClient,
+)
 
 
 class ClientReadinessTests(unittest.TestCase):
@@ -16,6 +19,7 @@ class ClientReadinessTests(unittest.TestCase):
             startup_timeout_seconds=2,
             request_timeout_seconds=30,
             service_restart_command=("restart-service",),
+            service_stop_command=("stop-service",),
             bridge_token=lambda: "bridge-token",
             public_manifest=lambda: {"fixed": True},
         )
@@ -102,6 +106,21 @@ class ClientReadinessTests(unittest.TestCase):
             )
         self.assertEqual(run.run_id, "run-2")
         self.assertIs(request.call_args.args[2]["continuation"], True)
+
+    def test_request_exposes_retryable_bridge_error_detail(self) -> None:
+        response = Mock(
+            ok=False,
+            status_code=500,
+            text='{"error":"Generation failed: error sending request for url"}',
+            reason="Internal Server Error",
+        )
+        response.json.return_value = {
+            "error": "Generation failed: error sending request for url"
+        }
+        with patch("requests.request", return_value=response):
+            with self.assertRaises(BridgeRequestError) as raised:
+                self._client()._request("POST", "/runs/1/ingest", {})
+        self.assertTrue(raised.exception.retryable_transport_failure)
 
 
 if __name__ == "__main__":
