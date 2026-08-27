@@ -97,6 +97,7 @@ Request:
 {
   "corpusId": "paperscope_summary-...",
   "projectPath": "/dedicated/benchmark/project",
+  "continuation": false,
   "config": {}
 }
 ```
@@ -124,14 +125,19 @@ Response:
 ```
 
 The route must reject a project mismatch and must never switch or delete an
-unrelated project. It also rejects a project whose `wiki/` contains data pages,
-rather than silently mixing prior knowledge into a new corpus.
+unrelated project. A fresh run (`continuation=false`) rejects a project whose
+`wiki/` contains data pages. After an intentional service restart, the runner may
+create a continuation run (`continuation=true`) for the same corpus; this preserves
+the existing knowledge base and validates that the protected General scaffold was
+not manually edited.
 
 ## `POST /runs/{runId}/ingest`
 
-The runner supplies canonical prepared corpus files. Copying or hard-linking them
-into `raw/sources` occurs before the timed region. The timed region starts
-immediately before LLM Wiki begins parsing the first source and ends only after:
+The runner supplies canonical prepared corpus files in batches, together with a
+zero-based `documentOffset` and `finalBatch`. Copying or hard-linking a batch into
+`raw/sources` occurs before its timed region. Each batch ends after all of its tasks
+and embeddings drain; only `finalBatch=true` runs the review sweep. Across the
+complete corpus, the active insertion duration ends only after:
 
 1. every source ingest task succeeds;
 2. image extraction and captioning finish;
@@ -155,11 +161,16 @@ Response:
     "searchOutputTokens": 0
   },
   "reviewSweepCompleted": true,
+  "finalBatch": true,
+  "documentOffset": 75,
+  "documentCount": 18,
   "embeddingDimensions": 1024
 }
 ```
 
-One failed source, caption, embedding, or sweep fails the entire request.
+One failed source, caption, embedding, or sweep fails the relevant request. The
+benchmark totals provider usage and active duration over every batch. Service
+restart time is recorded separately as operational wall-clock overhead.
 
 ## `POST /runs/{runId}/qa`
 

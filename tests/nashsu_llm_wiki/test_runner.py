@@ -30,14 +30,22 @@ class FakeBridge:
         self.deleted = False
         self.project_paths: list[Path] = []
         self.ready_paths: list[Path] = []
+        self.ingest_calls: list[tuple[int, bool, int]] = []
+        self.restart_count = 0
 
     def wait_until_ready(self, project_path: Path) -> None:
         self.ready_paths.append(project_path)
 
-    def create_run(self, *, corpus_id: str, project_path: Path) -> RunInfo:
+    def create_run(
+        self,
+        *,
+        corpus_id: str,
+        project_path: Path,
+        continuation: bool = False,
+    ) -> RunInfo:
         self.project_paths.append(project_path)
         return RunInfo(
-            "run-1",
+            f"run-{len(self.project_paths)}",
             {
                 "template": "general",
                 "outputLanguage": "auto",
@@ -56,8 +64,19 @@ class FakeBridge:
             },
         )
 
-    def ingest(self, run_id: str, documents: list[Path]) -> StageResult:
+    def ingest(
+        self,
+        run_id: str,
+        documents: list[Path],
+        *,
+        document_offset: int = 0,
+        final_batch: bool = True,
+    ) -> StageResult:
+        self.ingest_calls.append((document_offset, final_batch, len(documents)))
         return StageResult(5.0, TokenUsage(10, 2, 30), {"status": "completed"})
+
+    def restart_service(self, project_path: Path) -> None:
+        self.restart_count += 1
 
     def answer(self, run_id: str, *, prompt: str, session_id: str) -> QaResult:
         self.prompts.append(prompt)
@@ -101,6 +120,9 @@ class RunnerTests(unittest.TestCase):
                 project_path=root / "project",
                 startup_timeout_seconds=30,
                 request_timeout_seconds=30,
+                ingest_batch_size=1,
+                restart_between_ingest_batches=True,
+                service_restart_command=("fake-restart",),
             )
             bridge = FakeBridge()
             runner = BenchmarkRunner(
@@ -114,7 +136,9 @@ class RunnerTests(unittest.TestCase):
 
             self.assertTrue(bridge.deleted)
             self.assertEqual(bridge.ready_paths, [root / "project"])
-            self.assertEqual(bridge.project_paths, [root / "project"])
+            self.assertEqual(bridge.project_paths, [root / "project", root / "project"])
+            self.assertEqual(bridge.ingest_calls, [(0, False, 1), (1, True, 1)])
+            self.assertEqual(bridge.restart_count, 1)
             self.assertEqual(len(set(bridge.sessions)), 2)
             self.assertEqual(
                 bridge.prompts[0],
@@ -126,7 +150,7 @@ class RunnerTests(unittest.TestCase):
             report = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 report["Insertion Efficiency (Total Dataset)"]["Total Insertion Token Cost"],
-                42,
+                84,
             )
             self.assertEqual(
                 report["Query Efficiency (Average Per Query)"]["Average Retrieval Token Cost"],
@@ -156,10 +180,13 @@ def _prepared_experiment(root: Path) -> PreparedExperiment:
     document_path = corpus / "document.txt"
     document_path.write_text("Padella is king.", encoding="utf-8")
     sha = hashlib.sha256(document_path.read_bytes()).hexdigest()
-    document: dict[str, Any] = {
-        "path": "corpus/document.txt",
-        "sha256": sha,
-    }
+    second_path = corpus / "second.txt"
+    second_path.write_text("The king is Padella.", encoding="utf-8")
+    second_sha = hashlib.sha256(second_path.read_bytes()).hexdigest()
+    documents: list[dict[str, Any]] = [
+        {"path": "corpus/document.txt", "sha256": sha},
+        {"path": "corpus/second.txt", "sha256": second_sha},
+    ]
     qas = [
         {"id": "q1", "question": "Who is king?", "gold_answers": ["Padella"]},
         {"id": "q2", "question": "Name the king.", "gold_answers": ["Padella"]},
@@ -169,13 +196,13 @@ def _prepared_experiment(root: Path) -> PreparedExperiment:
         dataset="fixture",
         raw_dataset="fixture",
         expected_qas=2,
-        expected_documents=1,
+        expected_documents=2,
         options={},
     )
     return PreparedExperiment(
         spec=spec,
         root=root / "prepared" / "fixture",
-        documents=[document],
+        documents=documents,
         qas=qas,
         corpus_fingerprint=sha,
     )

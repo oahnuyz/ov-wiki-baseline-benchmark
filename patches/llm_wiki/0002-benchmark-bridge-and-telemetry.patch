@@ -288,7 +288,7 @@ index 796c75c..d8a7c2e 100644
 +        app,
 +        "ingest",
 +        value,
-+        Duration::from_secs(24 * 60 * 60),
++        Duration::from_secs(36 * 60 * 60),
 +    ) {
 +        Ok(result) => ok(result),
 +        Err(error) => err(502, error),

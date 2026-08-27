@@ -32,8 +32,12 @@ execution:
   review_sweep_in_ingest: true
   qa_workers: 1
   judge_workers: 1
+  ingest_batch_size: 25
+  restart_between_ingest_batches: true
+  service_restart_command:
+    - "/home/ZhangYunhao/nashsu-llm-wiki-baseline/tools/restart-llm-wiki-headless.sh"
   startup_timeout_seconds: 300
-  request_timeout_seconds: 1800
+  request_timeout_seconds: 129600
 
 paths:
   output_dir: "~/nashsu-llm-wiki-baseline/results"

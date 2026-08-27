@@ -13,12 +13,16 @@
 - 补丁顺序：
   1. `patches/llm_wiki/0001-volcengine-thinking-and-dimension.patch`
   2. `patches/llm_wiki/0002-benchmark-bridge-and-telemetry.patch`
+  3. `patches/llm_wiki/0003-webkit-request-timeout-fallback.patch`
+  4. `patches/llm_wiki/0004-restart-safe-batched-ingest.patch`
 - Python 实验入口：`ov-wiki-nashsu`
 - 固定配置：`baseline_configs/nashsu_llm_wiki.yaml`
 
 `0001` 负责 Volcengine 关闭深度思考的请求格式以及 1024 维 embedding 的强校验；
 `0002` 增加只用于 benchmark 的本地控制接口、真实 token telemetry、完整入库等待、
-独立 QA 和定向清理能力。补丁不替换 Nashsu 的知识生成、Agent 或检索算法。
+独立 QA 和定向清理能力；`0003` 为旧 WebKitGTK 补齐单次 provider 请求 timeout；`0004`
+增加分批 drain、受校验的跨重启续批和跨 run staging 清理。补丁不替换 Nashsu 的知识生成、
+Agent 或检索算法。
 
 ## 2. 两类 token：bridge token 与 Ark API key
 
@@ -162,6 +166,8 @@ runner 将一个实验全部文档的 `sha256` 排序后串联，再计算 corpu
 | thinking | 开/关/不同预算 | `disabled` | 向 Ark 发送 `thinking: {"type":"disabled"}` |
 | streaming | 开/关 | 关 | 非流式响应才能稳定取得完整 provider usage |
 | ingest worker | 1–5 | `1` | corpus 文档串行处理，避免上下文和计时相互污染 |
+| 入库批大小 | 正整数 | `25` 篇 | 每批保持同一知识库，批间重启 WebKit 服务以释放进程 mappings |
+| 批间服务重启 | 开/关 | 开 | 非最终批完成后自动重启；最终批完成后不重启，直接进入 QA |
 | QA worker | 可并行 | `1` | 逐题串行 |
 | Judge worker | 可并行 | `1` | 逐题串行，与参考 baseline 对齐 |
 | PDF 解析 | 内置 / MinerU Cloud / MinerU Local | 内置 | MinerU 强制关闭 |
@@ -174,7 +180,7 @@ runner 将一个实验全部文档的 `sha256` 排序后串联，再计算 corpu
 | parsed Markdown 副本 | 开/关 | 关 | 固定 `persistExtractedMarkdown=false` |
 | headless 启动 | 可见桌面 / 隐藏 WebView | 隐藏 WebView | Xvfb 中保留官方前端入库链路，不需要人工点击 |
 | startup timeout | 可配置 | `300` 秒 | runner 等待 bridge 和专用项目就绪；不计入实验时间 |
-| bridge timeout | 可配置 | `1800` 秒 | 当前 YAML 对单次 HTTP 请求的超时 |
+| bridge timeout | 可配置 | `129600` 秒（36 小时） | 对单批入库或单次 QA/Judge HTTP 请求的上限，不是整个 corpus 的总时限 |
 
 ### 5.2 Agent mode 与 retrieval mode 是两个独立参数
 
@@ -274,13 +280,18 @@ runner 先校验 prepared 数据和共享 corpus fingerprint。bridge 创建 run
 - 固定版本、模型、检索、caption、PDF 和 embedding manifest 完全一致；
 - 项目没有被另一个 benchmark run 占用。
 
-每个 corpus 文件随后复制到：
+每个 corpus 文件按 prepared 清单顺序分批复制到：
 
 ```text
 <project>/raw/sources/.benchmark-<run_id>/
 ```
 
-**文件复制不计入入库时间。** staging 完成后才启动计时和 token telemetry。
+**文件复制不计入入库时间。** 每一批 staging 完成后才启动该批计时和 token telemetry。
+默认每批 25 篇、并发仍为 1。非最终批只等待本批队列完全 drain，不运行 review sweep；
+随后 runner 重启整个 headless 服务、等待 readiness，并以显式 `continuation=true` 创建同一
+corpus 的续批 run。续批接口会校验 `purpose.md`、`schema.md` 和 `overview.md` 仍是未经人工
+编辑的 General 默认文件，并保留前批生成的 Wiki 页面、索引、向量库、review 和 ingest cache。
+因此这是进程资源的分段释放，不是知识库清空或断点跳过。
 
 ### 7.2 串行队列与解析
 
@@ -320,7 +331,8 @@ caption cache 以“图片字节 SHA-256 + 输出语言”为 key，存放在
 Nashsu 对每个源执行核心两阶段 LLM 入库。Markdown 页面不是等所有源完成后统一生成：在
 worker=1 下，每份文档依次完成“解析 → caption → analysis → generation → 写页/合并 →
 更新 index → embedding”，然后才处理下一份文档。因此后面的文档能够读取前面文档已经
-生成的页面和更新后的 index。全部文档都完成后才运行一次 review sweep。
+生成的页面和更新后的 index；这一点跨服务重启和跨批次保持不变。全部文档都完成后才运行
+一次 review sweep。
 
 #### 阶段 1：Analysis
 
@@ -379,7 +391,8 @@ batch size=1，但尚未显式清空已有项目的 chunk 长度覆盖值。
 
 ### 7.6 Review sweep
 
-只有所有 corpus 任务结束、队列 drain 后，入库轮才继续执行 review sweep。sweep 分两级：
+只有最终批的所有 corpus 任务结束、队列 drain 后，入库轮才执行唯一一次 review sweep。
+中间批次不会执行 sweep。sweep 分两级：
 
 1. **规则级清理**：例如 missing-page 对应页面已存在，或 duplicate 涉及页面已变化；
 2. **LLM 语义判断**：对剩余 review 保守判断是否已被新 Wiki 内容解决。
@@ -387,8 +400,12 @@ batch size=1，但尚未显式清空已有项目的 chunk 长度覆盖值。
 LLM sweep 每批最多 40 个 review，最多 5 批；prompt 最多列出 300 个 Wiki 页面。如果一批
 没有解决任何 review，会提前停止后续批次。
 
-**入库结束时间点是 review sweep 完成并收集完 provider usage 之后。** 这意味着入库时间
-包括解析、图片提取/caption、知识生成、文件写入、页面 embedding 和完整 review sweep。
+**入库结束时间点是最终 review sweep 完成并收集完 provider usage 之后。** 主指标
+`Total Insertion Time` 是各批 active duration 之和，包含解析、图片提取/caption、知识生成、
+文件写入、页面 embedding 和最终完整 review sweep，但不包含 staging 与批间服务重启。
+报告另列 `Operational Wall Clock Time Including Restarts`，表示从第一批开始到最终批完成的
+实际墙钟时间，包含批间重启与 readiness 等待。这样既保持原 baseline 的入库计时边界，又
+透明记录为规避 WebKit mappings 上限而付出的运行开销。
 
 ### 7.7 入库 token
 
@@ -653,14 +670,18 @@ F1        = 2 × precision × recall / (precision + recall)
 
 ```text
 Total Insertion Time
-  = 首个源开始进入 Nashsu ingest pipeline
-    到所有源、页面 embedding 和 review sweep 完成的墙钟时间
+  = Σ 每批 active duration
+  = 所有解析、caption、知识生成、写入、页面 embedding
+    加最终唯一一次 review sweep 的时间
 
 Total Insertion Token Cost
   = ingest_input_tokens + ingest_output_tokens + ingest_embedding_tokens
 ```
 
-文件 staging/copy 不计时。报告同时记录源文档数和 `Includes Review Sweep=true`。
+文件 staging/copy 和批间服务重启不计入主指标。报告同时记录实际 operational wall clock、
+源文档数、批大小、批数、重启次数、`Ingest Concurrency=1`、
+`Includes Review Sweep=true` 和 `Review Sweep Count=1`。以 PaperScope 93 篇为例，默认形成
+25/25/25/18 四批，批间重启 3 次，最终只 sweep 1 次。
 
 ### 11.5 QA 效率
 
@@ -731,18 +752,18 @@ Total Deletion Token Cost = 0
 - headless bridge listener 或指定项目在 300 秒内未就绪；
 - headless 项目目录非空但不是有效 LLM Wiki 项目。
 
-## 14. 真实实验前仍需实施或验证的事项
+## 14. 部署验证状态与结果解释限制
 
 模式与输入原则已经确定：官方 General 模板不做人工编辑、`mode=standard`、
-`retrievalMode=standard`，并且不增加 QA 动作硬限制。正式实验前还剩以下实施或环境验证项：
+`retrievalMode=standard`，并且不增加 QA 动作硬限制。正式 PaperScope 实验启动前已完成：
 
-1. **服务器完整编译验证**：两个补丁已通过顺序 `git apply --check`，本地 TypeScript
-   类型检查与 mock 测试已通过；仍需在服务器的用户态 Node/Tauri sysroot 中完成 Rust/Linux
-   编译和 Xvfb 启动验证。
-2. **Agent trace smoke test**：不增加动作 allowlist，也不强制至少一次检索；但需验证真实
-   Ark 模型能稳定遵守 Agent JSON 协议，并确认逐题输出完整记录工具序列。直接 final 或理论
-   上出现的非检索动作保留为 Nashsu 官方行为，应通过 trace 审计而不是修改算法。
-3. **Recall 指标**：当前 Recall 为占位 0。若要比较检索质量，应定义基于 gold document IDs
+1. **服务器完整编译验证**：四个补丁可顺序应用；TypeScript typecheck、相关 Vitest、Rust
+   `cargo check`、Python 14 项单元测试和带 `tauri/custom-protocol` 的 Linux release 构建通过。
+2. **重启续批 smoke test**：Xvfb/WebKit readiness、完整进程组重启、重启后
+   `continuation=true` 的受保护脚手架校验均通过，未调用模型。
+3. **Agent trace 审计**：不增加动作 allowlist，也不强制至少一次检索。正式 QA 的逐题输出
+   会记录工具序列；直接 final 或理论上的非检索动作保留为 Nashsu 官方行为，通过 trace 审计。
+4. **Recall 指标**：当前 Recall 为占位 0。若要比较检索质量，应定义基于 gold document IDs
    或 evidence 的 Recall@K，并确保 Nashsu trace 可以映射回标准文档。
 
 General 脚手架恢复、`outputLanguage=auto`、官方默认 chunk 参数和
@@ -750,4 +771,4 @@ General 脚手架恢复、`outputLanguage=auto`、官方默认 chunk 参数和
 策略只记录 `usage_complete=false`，不使实验失败；Judge token 不进入本实验要求的 Accuracy、
 端到端 QA、入库或删除成本指标。
 
-在这些项目确认之前，适合先做编译测试和极小 smoke test，不宜直接启动全部付费实验。
+上述 Recall 限制不影响本实验要求的 Accuracy、端到端回答时间和 token/入库/删除指标。

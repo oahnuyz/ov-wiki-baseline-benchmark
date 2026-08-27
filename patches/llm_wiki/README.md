@@ -17,6 +17,10 @@ git apply --check /path/to/patches/llm_wiki/0001-volcengine-thinking-and-dimensi
 git apply /path/to/patches/llm_wiki/0001-volcengine-thinking-and-dimension.patch
 git apply --check /path/to/patches/llm_wiki/0002-benchmark-bridge-and-telemetry.patch
 git apply /path/to/patches/llm_wiki/0002-benchmark-bridge-and-telemetry.patch
+git apply --check /path/to/patches/llm_wiki/0003-webkit-request-timeout-fallback.patch
+git apply /path/to/patches/llm_wiki/0003-webkit-request-timeout-fallback.patch
+git apply --check /path/to/patches/llm_wiki/0004-restart-safe-batched-ingest.patch
+git apply /path/to/patches/llm_wiki/0004-restart-safe-batched-ingest.patch
 ```
 
 `0001` makes the approved model settings enforceable on both the TypeScript ingest
@@ -42,8 +46,22 @@ telemetry described in `bridge_contract.md`:
   the dedicated General project is initialized/opened without user interaction,
   and an authenticated readiness endpoint prevents startup races.
 
+`0003` keeps the existing per-model-call timeout active on older WebKitGTK
+runtimes that do not expose `AbortSignal.timeout`. This prevents a dropped
+provider response from leaving an ingest task permanently stuck in
+`processing`; the queue can receive the timeout error and use its normal retry
+policy.
+
+`0004` makes long corpus ingestion restart-safe without changing ingest concurrency:
+
+- each non-final batch drains completely without running the review sweep;
+- the runner may restart the headless WebKit service and open an explicitly
+  validated continuation run against the same corpus knowledge base;
+- the final batch performs exactly one review sweep;
+- deletion removes staging directories created by every continuation run.
+
 The benchmark runner does not accept the stock LLM Wiki API as a benchmark bridge.
 Stock `AgentUsage` reports character counts, not provider tokens, and the stock API
-does not expose an atomic ingest-plus-review-sweep operation. Apply both patches to
+does not expose an atomic ingest-plus-review-sweep operation. Apply the patches to
 obtain the bridge specified in [`bridge_contract.md`](bridge_contract.md); the runner
-never substitutes character estimates.
+never substitutes character estimates. Apply all four patches in order.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -53,33 +54,68 @@ class LlmWikiBridgeClient:
             f"{self.config.startup_timeout_seconds}s: {last_error}"
         )
 
-    def create_run(self, *, corpus_id: str, project_path: Path) -> RunInfo:
+    def create_run(
+        self,
+        *,
+        corpus_id: str,
+        project_path: Path,
+        continuation: bool = False,
+    ) -> RunInfo:
         value = self._request(
             "POST",
             "/runs",
             {
                 "corpusId": corpus_id,
                 "projectPath": str(project_path),
+                "continuation": continuation,
                 "config": self.config.public_manifest(),
             },
         )
         return RunInfo.from_wire(value)
 
-    def ingest(self, run_id: str, documents: list[Path]) -> StageResult:
+    def ingest(
+        self,
+        run_id: str,
+        documents: list[Path],
+        *,
+        document_offset: int = 0,
+        final_batch: bool = True,
+    ) -> StageResult:
         value = self._request(
             "POST",
             f"/runs/{run_id}/ingest",
-            {"documents": [str(path) for path in documents], "wait": True},
+            {
+                "documents": [str(path) for path in documents],
+                "documentOffset": document_offset,
+                "finalBatch": final_batch,
+                "wait": True,
+            },
         )
         stage = StageResult.from_wire(value, context="ingestion")
-        if value.get("reviewSweepCompleted") is not True:
-            raise RuntimeError("Ingestion response does not include a completed review sweep")
+        if value.get("reviewSweepCompleted") is not final_batch:
+            raise RuntimeError(
+                "Ingestion response review sweep state does not match finalBatch"
+            )
         if value.get("embeddingDimensions") != 1024:
             raise RuntimeError(
                 "Embedding dimension mismatch: "
                 f"expected 1024, got {value.get('embeddingDimensions')!r}"
             )
         return stage
+
+    def restart_service(self, project_path: Path) -> None:
+        command = self.config.service_restart_command
+        if not command:
+            raise RuntimeError("No service_restart_command is configured")
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                timeout=self.config.startup_timeout_seconds,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"Failed to restart LLM Wiki service: {exc}") from exc
+        self.wait_until_ready(project_path)
 
     def answer(self, run_id: str, *, prompt: str, session_id: str) -> QaResult:
         value = self._request(

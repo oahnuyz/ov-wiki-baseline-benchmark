@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,8 +22,22 @@ from .models import QaResult, RunInfo, StageResult, TokenUsage
 
 class Bridge(Protocol):
     def wait_until_ready(self, project_path: Path) -> None: ...
-    def create_run(self, *, corpus_id: str, project_path: Path) -> RunInfo: ...
-    def ingest(self, run_id: str, documents: list[Path]) -> StageResult: ...
+    def create_run(
+        self,
+        *,
+        corpus_id: str,
+        project_path: Path,
+        continuation: bool = False,
+    ) -> RunInfo: ...
+    def ingest(
+        self,
+        run_id: str,
+        documents: list[Path],
+        *,
+        document_offset: int = 0,
+        final_batch: bool = True,
+    ) -> StageResult: ...
+    def restart_service(self, project_path: Path) -> None: ...
     def answer(self, run_id: str, *, prompt: str, session_id: str) -> QaResult: ...
     def delete(self, run_id: str) -> StageResult: ...
 
@@ -109,8 +124,15 @@ class BenchmarkRunner:
         }
         self._write_group_manifest(corpus_id, group_manifest)
 
-        ingestion = self.bridge.ingest(run_id, canonical.document_paths)
+        ingestion, run_id, run_ids = self._run_ingest_batches(
+            canonical,
+            corpus_id=corpus_id,
+            initial_run=run,
+            group_manifest=group_manifest,
+        )
         group_manifest["status"] = "ingested"
+        group_manifest["run_id"] = run_id
+        group_manifest["run_ids"] = run_ids
         group_manifest["ingestion"] = _stage_dict(ingestion)
         self._write_group_manifest(corpus_id, group_manifest)
 
@@ -127,6 +149,97 @@ class BenchmarkRunner:
         group_manifest["deletion"] = _stage_dict(deletion)
         self._write_group_manifest(corpus_id, group_manifest)
         return group_manifest
+
+    def _run_ingest_batches(
+        self,
+        experiment: PreparedExperiment,
+        *,
+        corpus_id: str,
+        initial_run: RunInfo,
+        group_manifest: dict[str, Any],
+    ) -> tuple[StageResult, str, list[str]]:
+        documents = experiment.document_paths
+        batch_size = self.config.ingest_batch_size
+        batches = [
+            documents[index : index + batch_size]
+            for index in range(0, len(documents), batch_size)
+        ]
+        if not batches:
+            raise ValueError("Prepared experiment contains no source documents")
+
+        active_seconds = 0.0
+        usage = TokenUsage()
+        batch_records: list[dict[str, Any]] = []
+        run = initial_run
+        run_ids = [run.run_id]
+        restart_count = 0
+        operational_started = time.monotonic()
+
+        for batch_index, batch in enumerate(batches):
+            offset = batch_index * batch_size
+            final_batch = batch_index == len(batches) - 1
+            group_manifest["status"] = "ingesting"
+            group_manifest["ingestion_progress"] = {
+                "completed_documents": offset,
+                "total_documents": len(documents),
+                "current_batch": batch_index + 1,
+                "batch_count": len(batches),
+                "batch_size": batch_size,
+                "restart_count": restart_count,
+            }
+            self._write_group_manifest(corpus_id, group_manifest)
+
+            result = self.bridge.ingest(
+                run.run_id,
+                batch,
+                document_offset=offset,
+                final_batch=final_batch,
+            )
+            active_seconds += result.duration_seconds
+            usage = usage + result.usage
+            batch_record = {
+                "batch_index": batch_index,
+                "run_id": run.run_id,
+                "document_offset": offset,
+                "document_count": len(batch),
+                "final_batch": final_batch,
+                **_stage_dict(result),
+            }
+            batch_records.append(batch_record)
+            group_manifest["ingestion_batches"] = list(batch_records)
+            group_manifest["ingestion_progress"] = {
+                "completed_documents": offset + len(batch),
+                "total_documents": len(documents),
+                "current_batch": batch_index + 1,
+                "batch_count": len(batches),
+                "batch_size": batch_size,
+                "restart_count": restart_count,
+            }
+            self._write_group_manifest(corpus_id, group_manifest)
+
+            if not final_batch and self.config.restart_between_ingest_batches:
+                self.bridge.restart_service(self.config.project_path)
+                restart_count += 1
+                run = self.bridge.create_run(
+                    corpus_id=corpus_id,
+                    project_path=self.config.project_path,
+                    continuation=True,
+                )
+                run_ids.append(run.run_id)
+
+        operational_seconds = time.monotonic() - operational_started
+        payload = {
+            "status": "completed",
+            "reviewSweepCompleted": True,
+            "reviewSweepCount": 1,
+            "embeddingDimensions": 1024,
+            "batchSize": batch_size,
+            "batchCount": len(batches),
+            "restartCount": restart_count,
+            "operationalWallClockSeconds": operational_seconds,
+            "batches": batch_records,
+        }
+        return StageResult(active_seconds, usage, payload), run.run_id, run_ids
 
     def _run_qa(
         self,
@@ -174,6 +287,15 @@ class BenchmarkRunner:
                     },
                 }
             )
+            self._write_generated_answers(experiment, records)
+        self._write_report(experiment, records, ingestion, deletion=None)
+        return records
+
+    def _write_generated_answers(
+        self,
+        experiment: PreparedExperiment,
+        records: list[dict[str, Any]],
+    ) -> None:
         output = self._experiment_output(experiment.spec.id)
         _write_json(
             output / "generated_answers.json",
@@ -181,12 +303,11 @@ class BenchmarkRunner:
                 "summary": {
                     "dataset": experiment.spec.id,
                     "total_queries": len(records),
+                    "complete": len(records) == len(experiment.qas),
                 },
                 "results": records,
             },
         )
-        self._write_report(experiment, records, ingestion, deletion=None)
-        return records
 
     def _run_judge(
         self,
@@ -219,16 +340,26 @@ class BenchmarkRunner:
                 judge_usage_complete = False
             else:
                 judge_usage = judge_usage + result.usage
-
-        output = self._experiment_output(experiment.spec.id)
-        _write_json(output / "qa_eval_detailed_results.json", {"results": records})
-        _write_json(
-            output / "judge_telemetry.json",
-            {
-                "usage_complete": judge_usage_complete,
-                **judge_usage.as_dict(),
-            },
-        )
+            output = self._experiment_output(experiment.spec.id)
+            _write_json(
+                output / "qa_eval_detailed_results.json",
+                {
+                    "complete": all(
+                        "llm_evaluation" in candidate for candidate in records
+                    ),
+                    "results": records,
+                },
+            )
+            _write_json(
+                output / "judge_telemetry.json",
+                {
+                    "usage_complete": judge_usage_complete,
+                    "completed_queries": sum(
+                        "llm_evaluation" in candidate for candidate in records
+                    ),
+                    **judge_usage.as_dict(),
+                },
+            )
         self._write_report(experiment, records, ingestion, deletion=None)
 
     def _write_final_report(
@@ -275,15 +406,26 @@ class BenchmarkRunner:
             "Benchmark Contract": self.config.public_manifest(),
             "Insertion Efficiency (Total Dataset)": {
                 "Total Insertion Time (s)": ingestion.duration_seconds,
+                "Operational Wall Clock Time Including Restarts (s)": (
+                    ingestion.payload.get("operationalWallClockSeconds")
+                ),
                 "Total Source Documents": len(experiment.documents),
                 "Total Input Tokens": ingestion.usage.input_tokens,
                 "Total Output Tokens": ingestion.usage.output_tokens,
                 "Total Embedding Tokens": ingestion.usage.embedding_tokens,
                 "Total Insertion Token Cost": ingestion.usage.total,
                 "Includes Review Sweep": True,
+                "Review Sweep Count": ingestion.payload.get("reviewSweepCount", 1),
+                "Ingest Batch Size": ingestion.payload.get("batchSize", 0),
+                "Ingest Batch Count": ingestion.payload.get("batchCount", 1),
+                "WebKit Restart Count": ingestion.payload.get("restartCount", 0),
+                "Ingest Concurrency": 1,
             },
             "Query Efficiency (Average Per Query)": {
                 "Average Retrieval Time (s)": qa_time / count if count else 0.0,
+                "Average End-to-End Answer Time (s)": (
+                    qa_time / count if count else 0.0
+                ),
                 "Average Retrieval Token Cost": (
                     (qa_input + qa_output + qa_embedding) / count if count else 0.0
                 ),
@@ -357,7 +499,21 @@ def _validate_answer_prompt(prompt: str) -> None:
 
 
 def _stage_dict(stage: StageResult) -> dict[str, Any]:
-    return {"duration_seconds": stage.duration_seconds, **stage.usage.as_dict()}
+    value: dict[str, Any] = {
+        "duration_seconds": stage.duration_seconds,
+        **stage.usage.as_dict(),
+    }
+    wire_names = {
+        "operationalWallClockSeconds": "operational_wall_clock_seconds",
+        "batchSize": "batch_size",
+        "batchCount": "batch_count",
+        "restartCount": "restart_count",
+        "reviewSweepCount": "review_sweep_count",
+    }
+    for wire_name, report_name in wire_names.items():
+        if wire_name in stage.payload:
+            value[report_name] = stage.payload[wire_name]
+    return value
 
 
 def _write_json(path: Path, value: Any) -> None:

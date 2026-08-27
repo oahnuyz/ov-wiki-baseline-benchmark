@@ -22,6 +22,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(manifest["llmWiki"]["outputLanguage"], "auto")
         self.assertEqual(manifest["llmWiki"]["chunking"], "official_default")
         self.assertIs(manifest["llmWiki"]["persistExtractedMarkdown"], False)
+        self.assertEqual(manifest["llmWiki"]["ingestConcurrency"], 1)
+        self.assertEqual(manifest["llmWiki"]["ingestBatchSize"], 25)
+        self.assertTrue(manifest["llmWiki"]["restartBetweenIngestBatches"])
+        self.assertTrue(config.service_restart_command)
         self.assertEqual(config.startup_timeout_seconds, 300)
         self.assertTrue(
             str(config.project_path).endswith(

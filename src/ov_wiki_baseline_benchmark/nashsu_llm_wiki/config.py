@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,9 @@ class BenchmarkConfig:
     project_path: Path
     startup_timeout_seconds: int
     request_timeout_seconds: int
+    ingest_batch_size: int = 25
+    restart_between_ingest_batches: bool = True
+    service_restart_command: tuple[str, ...] = ()
 
     @classmethod
     def from_yaml(cls, path: Path) -> "BenchmarkConfig":
@@ -71,6 +75,11 @@ class BenchmarkConfig:
             project_path=Path(_text(paths, "project_path")).expanduser().resolve(),
             startup_timeout_seconds=_integer(execution, "startup_timeout_seconds"),
             request_timeout_seconds=_integer(execution, "request_timeout_seconds"),
+            ingest_batch_size=_optional_integer(execution, "ingest_batch_size", 25),
+            restart_between_ingest_batches=_optional_boolean(
+                execution, "restart_between_ingest_batches", True
+            ),
+            service_restart_command=_command(execution.get("service_restart_command")),
         )
         cfg.validate()
         return cfg
@@ -104,6 +113,13 @@ class BenchmarkConfig:
             raise ValueError("Invalid fixed benchmark config: " + "; ".join(mismatches))
         if self.startup_timeout_seconds <= 0 or self.request_timeout_seconds <= 0:
             raise ValueError("startup and request timeouts must be positive")
+        if self.ingest_batch_size <= 0:
+            raise ValueError("ingest_batch_size must be positive")
+        if self.restart_between_ingest_batches and not self.service_restart_command:
+            raise ValueError(
+                "service_restart_command is required when "
+                "restart_between_ingest_batches=true"
+            )
 
     def bridge_token(self) -> str:
         return _required_env(self.bridge_token_env)
@@ -132,6 +148,9 @@ class BenchmarkConfig:
                 "imageCaptioning": True,
                 "pdfParser": "builtin",
                 "reviewSweepIncludedInIngest": True,
+                "ingestConcurrency": 1,
+                "ingestBatchSize": self.ingest_batch_size,
+                "restartBetweenIngestBatches": self.restart_between_ingest_batches,
             },
             "model": {
                 "name": self.model,
@@ -169,6 +188,37 @@ def _integer(parent: dict[str, Any], key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"Config field {key!r} must be an integer")
     return value
+
+
+def _optional_integer(parent: dict[str, Any], key: str, default: int) -> int:
+    value = parent.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Benchmark config field {key!r} must be an integer")
+    return value
+
+
+def _optional_boolean(parent: dict[str, Any], key: str, default: bool) -> bool:
+    value = parent.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"Benchmark config field {key!r} must be a boolean")
+    return value
+
+
+def _command(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        parts = shlex.split(value)
+    elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+        parts = [item for item in value if item]
+    else:
+        raise ValueError(
+            "Benchmark config field 'service_restart_command' must be a string "
+            "or a list of strings"
+        )
+    if not parts:
+        raise ValueError("service_restart_command must not be empty")
+    return tuple(parts)
 
 
 def _required_env(name: str) -> str:

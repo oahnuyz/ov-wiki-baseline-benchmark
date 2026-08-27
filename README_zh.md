@@ -147,7 +147,7 @@ Question: {question}
 返回的真实 usage；任何缺失字段都会令实验失败，不使用字符数估算。LLM Wiki
 fork 需要实现的接口见
 [`patches/llm_wiki/bridge_contract.md`](patches/llm_wiki/bridge_contract.md)，实际实现位于
-[`patches/llm_wiki/`](patches/llm_wiki/) 的两个顺序补丁中。`paths.project_path`
+[`patches/llm_wiki/`](patches/llm_wiki/) 的四个顺序补丁中。`paths.project_path`
 指向一个专用 LLM Wiki 项目。benchmark headless 模式下，隐藏 WebView 会自动初始化并打开
 该项目；runner 在开始前等待鉴权 readiness 接口，不同 corpus 组之间会完整清理并复用项目。
 
