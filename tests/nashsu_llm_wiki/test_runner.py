@@ -25,7 +25,12 @@ from ov_wiki_baseline_benchmark.specs import ExperimentSpec, repository_root
 
 
 class FakeBridge:
-    def __init__(self, *, fail_first_ingest: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_first_ingest: bool = False,
+        incomplete_telemetry_offsets: set[int] | None = None,
+    ) -> None:
         self.prompts: list[str] = []
         self.sessions: list[str] = []
         self.deleted = False
@@ -35,6 +40,7 @@ class FakeBridge:
         self.restart_count = 0
         self.stop_count = 0
         self.failures_remaining = 1 if fail_first_ingest else 0
+        self.incomplete_telemetry_offsets = set(incomplete_telemetry_offsets or set())
 
     def wait_until_ready(self, project_path: Path) -> None:
         self.ready_paths.append(project_path)
@@ -84,6 +90,12 @@ class FakeBridge:
             raise BridgeRequestError(
                 status_code=500,
                 detail="Generation failed: error sending request for url",
+            )
+        if document_offset in self.incomplete_telemetry_offsets:
+            self.incomplete_telemetry_offsets.remove(document_offset)
+            raise BridgeRequestError(
+                status_code=502,
+                detail="Provider usage telemetry was incomplete during ingestion",
             )
         return StageResult(5.0, TokenUsage(10, 2, 30), {"status": "completed"})
 
@@ -256,6 +268,72 @@ class RunnerTests(unittest.TestCase):
             self.assertIsNone(insertion["Discarded Retry Token Usage"])
             self.assertFalse(insertion["Snapshot Cleanup Included In Deletion Time"])
 
+    def test_incomplete_ingest_usage_is_accepted_and_reported_as_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            experiment = _prepared_experiment(root)
+            (root / "project").mkdir()
+            config = _config(root)
+            bridge = FakeBridge(incomplete_telemetry_offsets={0})
+            runner = BenchmarkRunner(
+                config,
+                answer_prompt_path=repository_root()
+                / "prompts"
+                / "ov_wiki_bot_answer.txt",
+                judge_prompt_path=repository_root()
+                / "prompts"
+                / "generic_llm_judge_user.txt",
+                bridge=bridge,
+                judge=FakeJudge(),
+            )
+
+            runner.run_group([experiment])
+
+            self.assertEqual(bridge.ingest_calls, [(0, False, 1), (1, True, 1)])
+            report = json.loads(
+                (
+                    root
+                    / "output"
+                    / "fixture"
+                    / "wiki"
+                    / "benchmark_metrics_report.json"
+                ).read_text(encoding="utf-8")
+            )
+            insertion = report["Insertion Efficiency (Total Dataset)"]
+            self.assertFalse(insertion["Token Usage Complete"])
+            self.assertIsNone(insertion["Total Insertion Token Cost"])
+            self.assertEqual(insertion["Known Insertion Token Cost (Lower Bound)"], 42)
+
+    def test_resume_recovers_immediately_preceding_incomplete_telemetry_batch(self) -> None:
+        retry_records = [
+            {
+                "batch_index": 1,
+                "attempt": 1,
+                "run_id": "run-2",
+                "duration_seconds": 12.5,
+                "error": "Provider usage telemetry was incomplete during ingestion",
+            }
+        ]
+
+        recovered = BenchmarkRunner._recover_completed_incomplete_telemetry_batch(
+            batches=[[Path("a")], [Path("b")], [Path("c")]],
+            batch_records=[
+                {
+                    "batch_index": 0,
+                    "document_count": 1,
+                    "duration_seconds": 4.0,
+                }
+            ],
+            retry_records=retry_records,
+        )
+
+        self.assertIsNotNone(recovered)
+        assert recovered is not None
+        self.assertEqual(recovered["batch_index"], 1)
+        self.assertEqual(recovered["document_offset"], 1)
+        self.assertFalse(recovered["token_usage_complete"])
+        self.assertEqual(retry_records, [])
+
 
 def _prepared_experiment(root: Path) -> PreparedExperiment:
     corpus = root / "prepared" / "fixture" / "corpus"
@@ -288,6 +366,32 @@ def _prepared_experiment(root: Path) -> PreparedExperiment:
         documents=documents,
         qas=qas,
         corpus_fingerprint=sha,
+    )
+
+
+def _config(root: Path) -> BenchmarkConfig:
+    return BenchmarkConfig(
+        bridge_base_url="http://127.0.0.1:19828",
+        bridge_token_env="TOKEN",
+        ark_api_key_env="ARK_API_KEY",
+        model="doubao-seed-2-0-lite-260428",
+        model_provider="volcengine",
+        model_base_url="https://ark.cn-beijing.volces.com/api/v3",
+        embedding_model="doubao-embedding-vision-251215",
+        embedding_provider="volcengine",
+        embedding_base_url="https://ark.cn-beijing.volces.com/api/v3",
+        embedding_dimensions=1024,
+        embedding_input="multimodal",
+        output_dir=root / "output",
+        project_path=root / "project",
+        startup_timeout_seconds=30,
+        request_timeout_seconds=30,
+        ingest_batch_size=1,
+        max_batch_retries=2,
+        restart_between_ingest_batches=True,
+        service_restart_command=("fake-restart",),
+        service_stop_command=("fake-stop",),
+        snapshot_root=root / "snapshots",
     )
 
 

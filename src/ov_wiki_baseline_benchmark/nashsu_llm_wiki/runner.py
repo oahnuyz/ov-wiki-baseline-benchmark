@@ -100,7 +100,12 @@ class BenchmarkRunner:
             timeout_seconds=config.request_timeout_seconds,
         )
 
-    def run_group(self, experiments: list[PreparedExperiment]) -> dict[str, Any]:
+    def run_group(
+        self,
+        experiments: list[PreparedExperiment],
+        *,
+        resume_ingest: bool = False,
+    ) -> dict[str, Any]:
         if not experiments:
             raise ValueError("At least one prepared experiment is required")
         fingerprints = {experiment.corpus_fingerprint for experiment in experiments}
@@ -112,28 +117,47 @@ class BenchmarkRunner:
                 raise ValueError("Shared-corpus group has inconsistent document counts")
 
         corpus_id = f"{canonical.spec.dataset}-{canonical.corpus_fingerprint[:16]}"
-        # Reuse one already-open dedicated project. Each corpus group is fully
-        # deleted before the next group, so no project switching is needed.
         project_path = self.config.project_path
         stale_cleanup = self.snapshots.cleanup_all().duration_seconds
         self.bridge.wait_until_ready(project_path)
-        run = self.bridge.create_run(corpus_id=corpus_id, project_path=project_path)
-        run_id = run.run_id
-        group_manifest: dict[str, Any] = {
-            "schema_version": "1.0",
-            "run_id": run_id,
-            "corpus_id": corpus_id,
-            "corpus_fingerprint": canonical.corpus_fingerprint,
-            "experiments": [experiment.spec.id for experiment in experiments],
-            "config": self.config.public_manifest(),
-            "project_scaffold": dict(run.project_scaffold),
-            "snapshot_audit": {
-                "stale_cleanup_seconds": stale_cleanup,
-                "excluded_from_primary_metrics": True,
-                "excluded_from_deletion_metrics": True,
-            },
-            "status": "created",
-        }
+        if resume_ingest:
+            group_manifest = self._read_group_manifest(corpus_id)
+            self._validate_resume_manifest(
+                group_manifest,
+                corpus_id=corpus_id,
+                experiments=experiments,
+            )
+            run = self.bridge.create_run(
+                corpus_id=corpus_id,
+                project_path=project_path,
+                continuation=True,
+            )
+            run_id = run.run_id
+            group_manifest["run_id"] = run_id
+            group_manifest["status"] = "resuming_ingest"
+            group_manifest.setdefault("snapshot_audit", {})[
+                "resume_stale_cleanup_seconds"
+            ] = stale_cleanup
+        else:
+            # Reuse one already-open dedicated project. Each corpus group is fully
+            # deleted before the next group, so no project switching is needed.
+            run = self.bridge.create_run(corpus_id=corpus_id, project_path=project_path)
+            run_id = run.run_id
+            group_manifest = {
+                "schema_version": "1.0",
+                "run_id": run_id,
+                "corpus_id": corpus_id,
+                "corpus_fingerprint": canonical.corpus_fingerprint,
+                "experiments": [experiment.spec.id for experiment in experiments],
+                "config": self.config.public_manifest(),
+                "project_scaffold": dict(run.project_scaffold),
+                "snapshot_audit": {
+                    "stale_cleanup_seconds": stale_cleanup,
+                    "excluded_from_primary_metrics": True,
+                    "excluded_from_deletion_metrics": True,
+                },
+                "status": "created",
+            }
         self._write_group_manifest(corpus_id, group_manifest)
         try:
             ingestion, run_id, run_ids = self._run_ingest_batches(
@@ -141,6 +165,7 @@ class BenchmarkRunner:
                 corpus_id=corpus_id,
                 initial_run=run,
                 group_manifest=group_manifest,
+                resume_ingest=resume_ingest,
             )
             group_manifest["status"] = "ingested"
             group_manifest["run_id"] = run_id
@@ -175,6 +200,7 @@ class BenchmarkRunner:
         corpus_id: str,
         initial_run: RunInfo,
         group_manifest: dict[str, Any],
+        resume_ingest: bool = False,
     ) -> tuple[StageResult, str, list[str]]:
         documents = experiment.document_paths
         batch_size = self.config.ingest_batch_size
@@ -185,23 +211,87 @@ class BenchmarkRunner:
         if not batches:
             raise ValueError("Prepared experiment contains no source documents")
 
-        active_seconds = 0.0
+        batch_records: list[dict[str, Any]] = (
+            list(group_manifest.get("ingestion_batches", [])) if resume_ingest else []
+        )
+        self._validate_completed_batches(batch_records, batches)
+        active_seconds = sum(
+            float(record["duration_seconds"]) for record in batch_records
+        )
         usage = TokenUsage()
-        batch_records: list[dict[str, Any]] = []
+        usage_complete = True
+        for record in batch_records:
+            usage_complete = usage_complete and record.get(
+                "token_usage_complete", True
+            )
+            usage = usage + _known_usage_from_stage_dict(record)
         run = initial_run
-        run_ids = [run.run_id]
-        restart_count = 0
-        planned_restart_count = 0
+        run_ids = list(
+            dict.fromkeys(
+                [
+                    str(record["run_id"])
+                    for record in batch_records
+                    if record.get("run_id")
+                ]
+                + [run.run_id]
+            )
+        )
+        previous_progress = group_manifest.get("ingestion_progress", {})
+        previous_restart_count = int(previous_progress.get("restart_count", 0))
+        resume_restart_count = 1 if resume_ingest and batch_records else 0
+        restart_count = previous_restart_count + resume_restart_count
+        planned_restart_count = previous_restart_count
         retry_restart_count = 0
         batch_retry_count = 0
         discarded_retry_seconds = 0.0
         snapshot_creation_seconds = 0.0
         snapshot_restore_seconds = 0.0
         snapshot_cleanup_seconds = 0.0
-        retry_records: list[dict[str, Any]] = []
+        retry_records: list[dict[str, Any]] = (
+            list(group_manifest.get("discarded_ingest_attempts", []))
+            if resume_ingest
+            else []
+        )
+        accepted_incomplete_records: list[dict[str, Any]] = list(
+            group_manifest.get("accepted_incomplete_ingest_telemetry", [])
+        )
+        if resume_ingest:
+            recovered = self._recover_completed_incomplete_telemetry_batch(
+                batches=batches,
+                batch_records=batch_records,
+                retry_records=retry_records,
+            )
+            if recovered is not None:
+                batch_records.append(recovered)
+                active_seconds += float(recovered["duration_seconds"])
+                usage_complete = False
+                accepted_incomplete_records.append(
+                    {
+                        **recovered,
+                        "accepted_during_resume": True,
+                    }
+                )
+                group_manifest["ingestion_batches"] = list(batch_records)
+                group_manifest["discarded_ingest_attempts"] = list(retry_records)
+                group_manifest["accepted_incomplete_ingest_telemetry"] = list(
+                    accepted_incomplete_records
+                )
+                self._write_group_manifest(corpus_id, group_manifest)
+            unresolved_next_batch = [
+                record
+                for record in retry_records
+                if record.get("batch_index") == len(batch_records)
+            ]
+            if unresolved_next_batch:
+                raise ValueError(
+                    "Resume cannot accept a partially written batch unless its only "
+                    "error is incomplete provider usage telemetry"
+                )
+        resumed_active_seconds = active_seconds
         operational_started = time.monotonic()
 
-        for batch_index, batch in enumerate(batches):
+        for batch_index in range(len(batch_records), len(batches)):
+            batch = batches[batch_index]
             offset = batch_index * batch_size
             final_batch = batch_index == len(batches) - 1
             group_manifest["status"] = "ingesting"
@@ -232,6 +322,36 @@ class BenchmarkRunner:
                         break
                     except BridgeRequestError as exc:
                         failed_seconds = time.monotonic() - attempt_started
+                        if _is_incomplete_ingest_telemetry(exc):
+                            result = StageResult(
+                                duration_seconds=failed_seconds,
+                                usage=TokenUsage(),
+                                payload={
+                                    "status": "completed",
+                                    "tokenUsageComplete": False,
+                                    "telemetryError": exc.detail,
+                                    "reviewSweepCompleted": final_batch,
+                                    "embeddingDimensions": 1024,
+                                },
+                            )
+                            accepted_incomplete_records.append(
+                                {
+                                    "batch_index": batch_index,
+                                    "attempt": attempt + 1,
+                                    "run_id": run.run_id,
+                                    "duration_seconds": failed_seconds,
+                                    "token_usage": None,
+                                    "token_usage_complete": False,
+                                    "error": exc.detail,
+                                    "accepted_as_completed_batch": True,
+                                    "excluded_from_primary_time_metrics": False,
+                                }
+                            )
+                            group_manifest[
+                                "accepted_incomplete_ingest_telemetry"
+                            ] = list(accepted_incomplete_records)
+                            self._write_group_manifest(corpus_id, group_manifest)
+                            break
                         retryable = exc.retryable_transport_failure
                         retry_record = {
                             "batch_index": batch_index,
@@ -271,6 +391,8 @@ class BenchmarkRunner:
                 ).duration_seconds
             active_seconds += result.duration_seconds
             usage = usage + result.usage
+            result_usage_complete = result.payload.get("tokenUsageComplete", True)
+            usage_complete = usage_complete and result_usage_complete
             batch_record = {
                 "batch_index": batch_index,
                 "run_id": run.run_id,
@@ -304,7 +426,9 @@ class BenchmarkRunner:
                 )
                 run_ids.append(run.run_id)
 
-        operational_seconds = time.monotonic() - operational_started
+        operational_seconds = (
+            resumed_active_seconds + time.monotonic() - operational_started
+        )
         payload = {
             "status": "completed",
             "reviewSweepCompleted": True,
@@ -316,6 +440,9 @@ class BenchmarkRunner:
             "plannedRestartCount": planned_restart_count,
             "retryRestartCount": retry_restart_count,
             "batchRetryCount": batch_retry_count,
+            "resumeRestartCount": resume_restart_count,
+            "tokenUsageComplete": usage_complete,
+            "knownTokenUsage": usage.as_dict(),
             "discardedRetryTimeSeconds": discarded_retry_seconds,
             "discardedRetryTokenUsage": None,
             "discardedRetryTokenUsageComplete": False if retry_records else True,
@@ -323,10 +450,94 @@ class BenchmarkRunner:
             "snapshotRestoreTimeSeconds": snapshot_restore_seconds,
             "snapshotCleanupTimeSeconds": snapshot_cleanup_seconds,
             "operationalWallClockSeconds": operational_seconds,
+            "operationalWallClockComplete": not resume_ingest,
             "batches": batch_records,
             "discardedAttempts": retry_records,
+            "acceptedIncompleteTelemetry": accepted_incomplete_records,
         }
         return StageResult(active_seconds, usage, payload), run.run_id, run_ids
+
+    def _read_group_manifest(self, corpus_id: str) -> dict[str, Any]:
+        path = self.config.output_dir / "groups" / corpus_id / "run.json"
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError(f"Invalid group manifest: {path}")
+        return value
+
+    def _validate_resume_manifest(
+        self,
+        manifest: dict[str, Any],
+        *,
+        corpus_id: str,
+        experiments: list[PreparedExperiment],
+    ) -> None:
+        if manifest.get("corpus_id") != corpus_id:
+            raise ValueError("Resume manifest corpus does not match the selected corpus")
+        if manifest.get("experiments") != [item.spec.id for item in experiments]:
+            raise ValueError("Resume manifest experiments do not match the selection")
+        if manifest.get("status") not in {"ingesting", "resuming_ingest"}:
+            raise ValueError(
+                "Resume requires a manifest whose status is 'ingesting' or "
+                "'resuming_ingest'"
+            )
+        if manifest.get("config") != self.config.public_manifest():
+            raise ValueError("Resume manifest benchmark configuration has changed")
+
+    @staticmethod
+    def _validate_completed_batches(
+        records: list[dict[str, Any]], batches: list[list[Path]]
+    ) -> None:
+        if len(records) > len(batches):
+            raise ValueError("Resume manifest has more completed batches than planned")
+        for index, record in enumerate(records):
+            expected_count = len(batches[index])
+            if record.get("batch_index") != index or record.get(
+                "document_count"
+            ) != expected_count:
+                raise ValueError(f"Resume manifest has an invalid batch {index + 1}")
+
+    @staticmethod
+    def _recover_completed_incomplete_telemetry_batch(
+        *,
+        batches: list[list[Path]],
+        batch_records: list[dict[str, Any]],
+        retry_records: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        next_index = len(batch_records)
+        candidates = [
+            record
+            for record in retry_records
+            if record.get("batch_index") == next_index
+            and record.get("error")
+            == "Provider usage telemetry was incomplete during ingestion"
+        ]
+        if not candidates:
+            return None
+        if next_index >= len(batches) or len(candidates) != 1:
+            raise ValueError("Cannot unambiguously recover incomplete ingestion telemetry")
+        attempt = candidates[0]
+        retry_records.remove(attempt)
+        batch_size = len(batches[next_index])
+        return {
+            "batch_index": next_index,
+            "run_id": attempt["run_id"],
+            "document_offset": sum(len(batch) for batch in batches[:next_index]),
+            "document_count": batch_size,
+            "final_batch": next_index == len(batches) - 1,
+            "attempt_count": int(attempt.get("attempt", 1)),
+            "retry_count": max(0, int(attempt.get("attempt", 1)) - 1),
+            "duration_seconds": float(attempt["duration_seconds"]),
+            "input_tokens": None,
+            "output_tokens": None,
+            "embedding_tokens": None,
+            "total_tokens": None,
+            "known_input_tokens": 0,
+            "known_output_tokens": 0,
+            "known_embedding_tokens": 0,
+            "known_total_tokens": 0,
+            "token_usage_complete": False,
+            "telemetry_error": attempt["error"],
+        }
 
     def _run_qa(
         self,
@@ -496,11 +707,39 @@ class BenchmarkRunner:
                 "Operational Wall Clock Time Including Restarts (s)": (
                     ingestion.payload.get("operationalWallClockSeconds")
                 ),
+                "Operational Wall Clock Time Complete": ingestion.payload.get(
+                    "operationalWallClockComplete", True
+                ),
                 "Total Source Documents": len(experiment.documents),
-                "Total Input Tokens": ingestion.usage.input_tokens,
-                "Total Output Tokens": ingestion.usage.output_tokens,
-                "Total Embedding Tokens": ingestion.usage.embedding_tokens,
-                "Total Insertion Token Cost": ingestion.usage.total,
+                "Token Usage Complete": ingestion.payload.get(
+                    "tokenUsageComplete", True
+                ),
+                "Total Input Tokens": (
+                    ingestion.usage.input_tokens
+                    if ingestion.payload.get("tokenUsageComplete", True)
+                    else None
+                ),
+                "Total Output Tokens": (
+                    ingestion.usage.output_tokens
+                    if ingestion.payload.get("tokenUsageComplete", True)
+                    else None
+                ),
+                "Total Embedding Tokens": (
+                    ingestion.usage.embedding_tokens
+                    if ingestion.payload.get("tokenUsageComplete", True)
+                    else None
+                ),
+                "Total Insertion Token Cost": (
+                    ingestion.usage.total
+                    if ingestion.payload.get("tokenUsageComplete", True)
+                    else None
+                ),
+                "Known Input Tokens (Lower Bound)": ingestion.usage.input_tokens,
+                "Known Output Tokens (Lower Bound)": ingestion.usage.output_tokens,
+                "Known Embedding Tokens (Lower Bound)": (
+                    ingestion.usage.embedding_tokens
+                ),
+                "Known Insertion Token Cost (Lower Bound)": ingestion.usage.total,
                 "Includes Review Sweep": True,
                 "Review Sweep Count": ingestion.payload.get("reviewSweepCount", 1),
                 "Ingest Batch Size": ingestion.payload.get("batchSize", 0),
@@ -511,6 +750,9 @@ class BenchmarkRunner:
                 ),
                 "Retry WebKit Restart Count": ingestion.payload.get(
                     "retryRestartCount", 0
+                ),
+                "Resume WebKit Restart Count": ingestion.payload.get(
+                    "resumeRestartCount", 0
                 ),
                 "Batch Retry Count": ingestion.payload.get("batchRetryCount", 0),
                 "Discarded Retry Time (s)": ingestion.payload.get(
@@ -613,10 +855,15 @@ def _validate_answer_prompt(prompt: str) -> None:
 
 
 def _stage_dict(stage: StageResult) -> dict[str, Any]:
-    value: dict[str, Any] = {
-        "duration_seconds": stage.duration_seconds,
-        **stage.usage.as_dict(),
-    }
+    usage_complete = stage.payload.get("tokenUsageComplete", True)
+    known_usage = stage.usage.as_dict()
+    value: dict[str, Any] = {"duration_seconds": stage.duration_seconds}
+    if usage_complete:
+        value.update(known_usage)
+    else:
+        value.update({name: None for name in known_usage})
+        value.update({f"known_{name}": amount for name, amount in known_usage.items()})
+    value["token_usage_complete"] = usage_complete
     wire_names = {
         "operationalWallClockSeconds": "operational_wall_clock_seconds",
         "batchSize": "batch_size",
@@ -625,6 +872,7 @@ def _stage_dict(stage: StageResult) -> dict[str, Any]:
         "reviewSweepCount": "review_sweep_count",
         "plannedRestartCount": "planned_restart_count",
         "retryRestartCount": "retry_restart_count",
+        "resumeRestartCount": "resume_restart_count",
         "batchRetryCount": "batch_retry_count",
         "discardedRetryTimeSeconds": "discarded_retry_time_seconds",
         "discardedRetryTokenUsage": "discarded_retry_token_usage",
@@ -637,6 +885,27 @@ def _stage_dict(stage: StageResult) -> dict[str, Any]:
         if wire_name in stage.payload:
             value[report_name] = stage.payload[wire_name]
     return value
+
+
+def _known_usage_from_stage_dict(value: dict[str, Any]) -> TokenUsage:
+    prefix = "" if value.get("token_usage_complete", True) else "known_"
+
+    def token(field: str) -> int:
+        candidate = value.get(f"{prefix}{field}", 0)
+        return candidate if isinstance(candidate, int) and not isinstance(candidate, bool) else 0
+
+    return TokenUsage(
+        input_tokens=token("input_tokens"),
+        output_tokens=token("output_tokens"),
+        embedding_tokens=token("embedding_tokens"),
+    )
+
+
+def _is_incomplete_ingest_telemetry(error: BridgeRequestError) -> bool:
+    return (
+        error.detail
+        == "Provider usage telemetry was incomplete during ingestion"
+    )
 
 
 def _write_json(path: Path, value: Any) -> None:
