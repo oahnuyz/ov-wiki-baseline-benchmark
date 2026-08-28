@@ -21,12 +21,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--config", default=str(root / "baseline_configs" / "nashsu_llm_wiki.yaml")
     )
     parser.add_argument(
+        "--resume",
         "--resume-ingest",
+        dest="resume",
         action="store_true",
         help=(
-            "Resume an interrupted ingestion from its group manifest. An immediately "
-            "preceding batch that completed with incomplete provider usage telemetry "
-            "is accepted as ingested."
+            "Resume an interrupted group from its manifest and saved QA outputs. An "
+            "immediately preceding ingestion batch that completed with incomplete "
+            "provider usage telemetry is accepted as ingested."
         ),
     )
     return parser
@@ -58,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
             judge_prompt_path=root / "prompts" / "generic_llm_judge_user.txt",
         )
         for group in group_prepared_experiments(prepared):
-            runner.run_group(group, resume_ingest=args.resume_ingest)
+            runner.run_group(group, resume_ingest=args.resume)
         return 0
     except KeyboardInterrupt as exc:
         print(f"Interrupted: {exc}", file=sys.stderr)

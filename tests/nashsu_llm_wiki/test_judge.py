@@ -52,6 +52,39 @@ class JudgeTests(unittest.TestCase):
             "Parse failed or model invocation failed. Defaulted to 0.",
         )
 
+    def test_literal_json_example_is_preserved_in_rendered_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            prompt = root / "judge.txt"
+            prompt.write_text(
+                "Question: {question}\nGold: {gold_answers_joined_by_pipe}\n"
+                "Answer: {generated_answer}\n"
+                'Respond: {"score": 0 to 4, "reasoning": "string"}\n',
+                encoding="utf-8",
+            )
+            judge = ArkJudge(
+                api_key="not-a-real-key",
+                base_url="https://example.invalid/v3",
+                model="model",
+                prompt_path=prompt,
+                timeout_seconds=1,
+            )
+            response = Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {
+                "choices": [{"message": {"content": '{"score": 4, "reasoning": "ok"}'}}]
+            }
+            with patch(
+                "ov_wiki_baseline_benchmark.nashsu_llm_wiki.judge.requests.post",
+                return_value=response,
+            ) as post:
+                result = judge.grade("Q", ["G1", "G2"], "A")
+
+        rendered = post.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertEqual(result.score, 4)
+        self.assertIn('{"score": 0 to 4, "reasoning": "string"}', rendered)
+        self.assertIn("Question: Q", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,10 +39,17 @@ class ArkJudge:
         self.timeout_seconds = timeout_seconds
 
     def grade(self, question: str, gold_answers: list[str], answer: str) -> JudgeResult:
-        prompt = self.prompt_template.format(
-            question=question,
-            gold_answers_joined_by_pipe=" | ".join(gold_answers),
-            generated_answer=answer,
+        # Match only the three approved placeholders so the literal JSON example
+        # remains unchanged. re.sub does not reinterpret braces in inserted values.
+        values = {
+            "question": question,
+            "gold_answers_joined_by_pipe": " | ".join(gold_answers),
+            "generated_answer": answer,
+        }
+        prompt = re.sub(
+            r"\{(question|gold_answers_joined_by_pipe|generated_answer)\}",
+            lambda match: values[match.group(1)],
+            self.prompt_template,
         )
         content = ""
         score = 0

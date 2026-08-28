@@ -127,6 +127,9 @@ class BenchmarkRunner:
                 corpus_id=corpus_id,
                 experiments=experiments,
             )
+            resume_from_status = str(
+                group_manifest.get("resume_from_status", group_manifest["status"])
+            )
             run = self.bridge.create_run(
                 corpus_id=corpus_id,
                 project_path=project_path,
@@ -134,6 +137,7 @@ class BenchmarkRunner:
             )
             run_id = run.run_id
             group_manifest["run_id"] = run_id
+            group_manifest["resume_from_status"] = resume_from_status
             group_manifest["status"] = "resuming_ingest"
             group_manifest.setdefault("snapshot_audit", {})[
                 "resume_stale_cleanup_seconds"
@@ -160,22 +164,50 @@ class BenchmarkRunner:
             }
         self._write_group_manifest(corpus_id, group_manifest)
         try:
-            ingestion, run_id, run_ids = self._run_ingest_batches(
-                canonical,
-                corpus_id=corpus_id,
-                initial_run=run,
-                group_manifest=group_manifest,
-                resume_ingest=resume_ingest,
-            )
-            group_manifest["status"] = "ingested"
-            group_manifest["run_id"] = run_id
-            group_manifest["run_ids"] = run_ids
-            group_manifest["ingestion"] = _stage_dict(ingestion)
-            self._write_group_manifest(corpus_id, group_manifest)
+            if resume_ingest and group_manifest.get("resume_from_status") in {
+                "ingested",
+                "answering",
+                "judging",
+            }:
+                ingestion = _stage_from_manifest_dict(group_manifest.get("ingestion"))
+                run_ids = list(group_manifest.get("run_ids", []))
+                if run_id not in run_ids:
+                    run_ids.append(run_id)
+            else:
+                ingestion, run_id, run_ids = self._run_ingest_batches(
+                    canonical,
+                    corpus_id=corpus_id,
+                    initial_run=run,
+                    group_manifest=group_manifest,
+                    resume_ingest=resume_ingest,
+                )
+                group_manifest["status"] = "ingested"
+                group_manifest["run_id"] = run_id
+                group_manifest["run_ids"] = run_ids
+                group_manifest["ingestion"] = _stage_dict(ingestion)
+                self._write_group_manifest(corpus_id, group_manifest)
 
             completed: list[tuple[PreparedExperiment, list[dict[str, Any]]]] = []
             for experiment in experiments:
-                records = self._run_qa(experiment, run_id, ingestion)
+                existing_records = (
+                    self._load_existing_records(experiment) if resume_ingest else []
+                )
+                group_manifest["status"] = "answering"
+                group_manifest["active_experiment"] = experiment.spec.id
+                group_manifest["completed_answers"] = len(existing_records)
+                self._write_group_manifest(corpus_id, group_manifest)
+                records = self._run_qa(
+                    experiment,
+                    run_id,
+                    ingestion,
+                    existing_records=existing_records,
+                )
+                group_manifest["status"] = "judging"
+                group_manifest["completed_answers"] = len(records)
+                group_manifest["completed_judgements"] = sum(
+                    "llm_evaluation" in record for record in records
+                )
+                self._write_group_manifest(corpus_id, group_manifest)
                 self._run_judge(experiment, records, ingestion)
                 completed.append((experiment, records))
 
@@ -183,6 +215,8 @@ class BenchmarkRunner:
             for experiment, records in completed:
                 self._write_final_report(experiment, records, ingestion, deletion)
             group_manifest["status"] = "completed"
+            group_manifest.pop("resume_from_status", None)
+            group_manifest.pop("active_experiment", None)
             group_manifest["deletion"] = _stage_dict(deletion)
             self._write_group_manifest(corpus_id, group_manifest)
             return group_manifest
@@ -475,10 +509,15 @@ class BenchmarkRunner:
             raise ValueError("Resume manifest corpus does not match the selected corpus")
         if manifest.get("experiments") != [item.spec.id for item in experiments]:
             raise ValueError("Resume manifest experiments do not match the selection")
-        if manifest.get("status") not in {"ingesting", "resuming_ingest"}:
+        if manifest.get("status") not in {
+            "ingesting",
+            "resuming_ingest",
+            "ingested",
+            "answering",
+            "judging",
+        }:
             raise ValueError(
-                "Resume requires a manifest whose status is 'ingesting' or "
-                "'resuming_ingest'"
+                "Resume requires an interrupted ingestion, QA, or Judge manifest"
             )
         if manifest.get("config") != self.config.public_manifest():
             raise ValueError("Resume manifest benchmark configuration has changed")
@@ -544,9 +583,11 @@ class BenchmarkRunner:
         experiment: PreparedExperiment,
         run_id: str,
         ingestion: StageResult,
+        *,
+        existing_records: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        for index, qa in enumerate(experiment.qas):
+        records = list(existing_records or [])
+        for index, qa in enumerate(experiment.qas[len(records) :], start=len(records)):
             session_id = f"benchmark-{experiment.spec.id}-{index}-{uuid.uuid4().hex}"
             prompt = self.answer_prompt.format(question=qa["question"])
             result = self.bridge.answer(run_id, prompt=prompt, session_id=session_id)
@@ -589,6 +630,30 @@ class BenchmarkRunner:
         self._write_report(experiment, records, ingestion, deletion=None)
         return records
 
+    def _load_existing_records(
+        self, experiment: PreparedExperiment
+    ) -> list[dict[str, Any]]:
+        output = self._experiment_output(experiment.spec.id)
+        candidates = [
+            output / "qa_eval_detailed_results.json",
+            output / "generated_answers.json",
+        ]
+        for path in candidates:
+            if not path.exists():
+                continue
+            value = json.loads(path.read_text(encoding="utf-8"))
+            records = value.get("results") if isinstance(value, dict) else None
+            if not isinstance(records, list):
+                raise ValueError(f"Invalid saved QA results: {path}")
+            if len(records) > len(experiment.qas):
+                raise ValueError(f"Saved QA results exceed experiment size: {path}")
+            for index, record in enumerate(records):
+                expected_id = experiment.qas[index].get("id")
+                if not isinstance(record, dict) or record.get("sample_id") != expected_id:
+                    raise ValueError(f"Saved QA results are misaligned at index {index}")
+            return records
+        return []
+
     def _write_generated_answers(
         self,
         experiment: PreparedExperiment,
@@ -615,7 +680,14 @@ class BenchmarkRunner:
     ) -> None:
         judge_usage = TokenUsage()
         judge_usage_complete = True
+        telemetry_path = self._experiment_output(experiment.spec.id) / "judge_telemetry.json"
+        if telemetry_path.exists():
+            telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
+            judge_usage = _known_usage_from_stage_dict(telemetry)
+            judge_usage_complete = telemetry.get("usage_complete", True)
         for record in records:
+            if "llm_evaluation" in record:
+                continue
             answer = record["llm"]["final_answer"]
             gold_answers = record["gold_answers"]
             f1 = max_token_f1(answer, gold_answers)
@@ -866,6 +938,7 @@ def _stage_dict(stage: StageResult) -> dict[str, Any]:
     value["token_usage_complete"] = usage_complete
     wire_names = {
         "operationalWallClockSeconds": "operational_wall_clock_seconds",
+        "operationalWallClockComplete": "operational_wall_clock_complete",
         "batchSize": "batch_size",
         "batchCount": "batch_count",
         "restartCount": "restart_count",
@@ -898,6 +971,47 @@ def _known_usage_from_stage_dict(value: dict[str, Any]) -> TokenUsage:
         input_tokens=token("input_tokens"),
         output_tokens=token("output_tokens"),
         embedding_tokens=token("embedding_tokens"),
+    )
+
+
+def _stage_from_manifest_dict(value: Any) -> StageResult:
+    if not isinstance(value, dict):
+        raise ValueError("Resume manifest is missing completed ingestion metrics")
+    duration = value.get("duration_seconds")
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+        raise ValueError("Resume manifest has invalid ingestion duration")
+    report_to_wire = {
+        "operational_wall_clock_seconds": "operationalWallClockSeconds",
+        "batch_size": "batchSize",
+        "batch_count": "batchCount",
+        "restart_count": "restartCount",
+        "review_sweep_count": "reviewSweepCount",
+        "planned_restart_count": "plannedRestartCount",
+        "retry_restart_count": "retryRestartCount",
+        "resume_restart_count": "resumeRestartCount",
+        "batch_retry_count": "batchRetryCount",
+        "discarded_retry_time_seconds": "discardedRetryTimeSeconds",
+        "discarded_retry_token_usage": "discardedRetryTokenUsage",
+        "discarded_retry_token_usage_complete": "discardedRetryTokenUsageComplete",
+        "snapshot_creation_time_seconds": "snapshotCreationTimeSeconds",
+        "snapshot_restore_time_seconds": "snapshotRestoreTimeSeconds",
+        "snapshot_cleanup_time_seconds": "snapshotCleanupTimeSeconds",
+    }
+    payload: dict[str, Any] = {
+        "status": "completed",
+        "tokenUsageComplete": value.get("token_usage_complete", True),
+        "operationalWallClockComplete": value.get(
+            "operational_wall_clock_complete",
+            value.get("resume_restart_count", 0) == 0,
+        ),
+    }
+    for report_name, wire_name in report_to_wire.items():
+        if report_name in value:
+            payload[wire_name] = value[report_name]
+    return StageResult(
+        duration_seconds=float(duration),
+        usage=_known_usage_from_stage_dict(value),
+        payload=payload,
     )
 
 

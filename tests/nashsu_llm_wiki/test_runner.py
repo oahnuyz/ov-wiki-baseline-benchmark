@@ -334,6 +334,60 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(recovered["token_usage_complete"])
         self.assertEqual(retry_records, [])
 
+    def test_resume_after_ingestion_reuses_saved_answers(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            experiment = _prepared_experiment(root)
+            (root / "project").mkdir()
+            config = _config(root)
+            initial_bridge = FakeBridge()
+            initial_runner = BenchmarkRunner(
+                config,
+                answer_prompt_path=repository_root()
+                / "prompts"
+                / "ov_wiki_bot_answer.txt",
+                judge_prompt_path=repository_root()
+                / "prompts"
+                / "generic_llm_judge_user.txt",
+                bridge=initial_bridge,
+                judge=FakeJudge(),
+            )
+            initial_runner.run_group([experiment])
+            group_path = (
+                root
+                / "output"
+                / "groups"
+                / f"fixture-{experiment.corpus_fingerprint[:16]}"
+                / "run.json"
+            )
+            manifest = json.loads(group_path.read_text(encoding="utf-8"))
+            manifest["status"] = "ingested"
+            manifest.pop("deletion", None)
+            group_path.write_text(json.dumps(manifest), encoding="utf-8")
+            output = root / "output" / "fixture" / "wiki"
+            (output / "qa_eval_detailed_results.json").unlink()
+            (output / "judge_telemetry.json").unlink()
+
+            resumed_bridge = FakeBridge()
+            resumed_runner = BenchmarkRunner(
+                config,
+                answer_prompt_path=repository_root()
+                / "prompts"
+                / "ov_wiki_bot_answer.txt",
+                judge_prompt_path=repository_root()
+                / "prompts"
+                / "generic_llm_judge_user.txt",
+                bridge=resumed_bridge,
+                judge=FakeJudge(),
+            )
+            resumed_runner.run_group([experiment], resume_ingest=True)
+
+            self.assertEqual(resumed_bridge.ingest_calls, [])
+            self.assertEqual(resumed_bridge.prompts, [])
+            self.assertTrue(resumed_bridge.deleted)
+            resumed_manifest = json.loads(group_path.read_text(encoding="utf-8"))
+            self.assertEqual(resumed_manifest["status"], "completed")
+
 
 def _prepared_experiment(root: Path) -> PreparedExperiment:
     corpus = root / "prepared" / "fixture" / "corpus"
