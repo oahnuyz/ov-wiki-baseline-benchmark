@@ -77,6 +77,7 @@ index 796c75c..d8a7c2e 100644
 +    id: String,
 +    corpus_id: String,
 +    project: ProjectEntry,
++    project_record_id: String,
 +}
  
  #[derive(Clone)]
@@ -246,10 +247,15 @@ index 796c75c..d8a7c2e 100644
 +                    }) => value.clone(),
 +        _ => return err(500, "Frontend did not confirm the General project scaffold"),
 +    };
++    let project_record_id = match read_project_id(&project.path) {
++        Some(id) => id,
++        None => return err(409, "Dedicated project record has no valid identity"),
++    };
 +    let run = BenchmarkRun {
 +        id: run_id.clone(),
 +        corpus_id,
 +        project,
++        project_record_id,
 +    };
 +    if let Ok(mut runs) = benchmark_runs().lock() {
 +        runs.insert(run_id.clone(), run);
@@ -421,7 +427,9 @@ index 796c75c..d8a7c2e 100644
 +        Ok(record) => record,
 +        Err(error) => return err(409, format!("Dedicated project record is unavailable: {error}")),
 +    };
-+    if read_project_id(&run.project.path).as_deref() != Some(run.project.id.as_str()) {
++    if read_project_id(&run.project.path).as_deref()
++        != Some(run.project_record_id.as_str())
++    {
 +        return err(409, "Dedicated project identity changed; refusing cleanup");
 +    }
 +
