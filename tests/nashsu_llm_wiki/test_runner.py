@@ -93,9 +93,10 @@ class FakeBridge:
             )
         if document_offset in self.incomplete_telemetry_offsets:
             self.incomplete_telemetry_offsets.remove(document_offset)
-            raise BridgeRequestError(
-                status_code=502,
-                detail="Provider usage telemetry was incomplete during ingestion",
+            return StageResult(
+                5.0,
+                TokenUsage(7, 1, 9),
+                {"status": "completed", "tokenUsageComplete": False},
             )
         return StageResult(5.0, TokenUsage(10, 2, 30), {"status": "completed"})
 
@@ -118,7 +119,22 @@ class FakeBridge:
 
     def delete(self, run_id: str) -> StageResult:
         self.deleted = True
-        return StageResult(0.5, TokenUsage(), {"status": "completed"})
+        return StageResult(
+            0.5,
+            TokenUsage(),
+            {
+                "status": "completed",
+                "searchableDeletionDurationSeconds": 0.5,
+                "frontendCleanupDurationSeconds": 0.1,
+                "postDeletionCleanupDurationSeconds": 0.2,
+                "onlySearchableDataIncludedInPrimaryTime": True,
+                "timedDeletionScope": [
+                    "wiki-pages",
+                    "raw-source-search-data",
+                    "lancedb-vectors",
+                ],
+            },
+        )
 
 
 class FakeJudge:
@@ -191,6 +207,15 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(
                 report["Deletion Efficiency (Total Dataset)"]["Total Deletion Token Cost"],
                 0,
+            )
+            deletion_report = report["Deletion Efficiency (Total Dataset)"]
+            self.assertEqual(deletion_report["Searchable Data Deletion Time (s)"], 0.5)
+            self.assertEqual(deletion_report["Frontend Quiescence Time (s)"], 0.1)
+            self.assertEqual(
+                deletion_report["Post-Deletion Cleanup and Recovery Time (s)"], 0.2
+            )
+            self.assertTrue(
+                deletion_report["Only Searchable Data Included In Primary Time"]
             )
             group_manifest = json.loads(
                 (
@@ -268,7 +293,7 @@ class RunnerTests(unittest.TestCase):
             self.assertIsNone(insertion["Discarded Retry Token Usage"])
             self.assertFalse(insertion["Snapshot Cleanup Included In Deletion Time"])
 
-    def test_incomplete_ingest_usage_is_accepted_and_reported_as_unknown(self) -> None:
+    def test_incomplete_ingest_usage_preserves_and_sums_known_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             experiment = _prepared_experiment(root)
@@ -302,7 +327,10 @@ class RunnerTests(unittest.TestCase):
             insertion = report["Insertion Efficiency (Total Dataset)"]
             self.assertFalse(insertion["Token Usage Complete"])
             self.assertIsNone(insertion["Total Insertion Token Cost"])
-            self.assertEqual(insertion["Known Insertion Token Cost (Lower Bound)"], 42)
+            self.assertEqual(insertion["Known Input Tokens (Lower Bound)"], 17)
+            self.assertEqual(insertion["Known Output Tokens (Lower Bound)"], 3)
+            self.assertEqual(insertion["Known Embedding Tokens (Lower Bound)"], 39)
+            self.assertEqual(insertion["Known Insertion Token Cost (Lower Bound)"], 59)
 
     def test_resume_recovers_immediately_preceding_incomplete_telemetry_batch(self) -> None:
         retry_records = [

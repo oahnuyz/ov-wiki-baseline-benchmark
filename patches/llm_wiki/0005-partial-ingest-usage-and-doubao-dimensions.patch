@@ -1,0 +1,120 @@
+diff --git a/src-tauri/src/api_server.rs b/src-tauri/src/api_server.rs
+index 02dd35f..be3e824 100644
+--- a/src-tauri/src/api_server.rs
++++ b/src-tauri/src/api_server.rs
+@@ -2394,10 +2394,14 @@ fn handle_benchmark_delete(app: &AppHandle, run_id: &str) -> ApiResponse {
+             }
+         }
+     }
++    // The benchmark deletion metric ends when all corpus-owned searchable
++    // state has been removed. Recreating the reusable project identity and
++    // cleaning the in-memory run registry are operational recovery work.
+     let metadata = project_root.join(".llm-wiki");
+     if let Err(error) = remove_benchmark_path(&metadata) {
+         return err(500, error);
+     }
++    let deletion_duration_seconds = started.elapsed().as_secs_f64();
+     if let Err(error) = fs::create_dir_all(&metadata)
+         .and_then(|_| fs::write(metadata.join("project.json"), record))
+     {
+@@ -2410,7 +2414,7 @@ fn handle_benchmark_delete(app: &AppHandle, run_id: &str) -> ApiResponse {
+     }
+     ok(json!({
+         "status": "completed",
+-        "durationSeconds": started.elapsed().as_secs_f64(),
++        "durationSeconds": deletion_duration_seconds,
+         "usage": { "inputTokens": 0, "outputTokens": 0, "embeddingTokens": 0 },
+     }))
+ }
+diff --git a/src-tauri/src/commands/search.rs b/src-tauri/src/commands/search.rs
+index 742c89c..6dd70d8 100644
+--- a/src-tauri/src/commands/search.rs
++++ b/src-tauri/src/commands/search.rs
+@@ -1281,7 +1281,7 @@ async fn fetch_embedding_once(
+     let body = if is_google {
+         google_embedding_body(&cfg.model, text, cfg.output_dimensionality)
+     } else if is_doubao_multimodal {
+-        doubao_multimodal_embedding_body(&cfg.model, text)
++        doubao_multimodal_embedding_body(&cfg.model, text, cfg.output_dimensionality)
+     } else {
+         json!({ "model": cfg.model, "input": text })
+     };
+@@ -1618,12 +1618,23 @@ fn google_embedding_body(model: &str, text: &str, output_dimensionality: Option<
+     body
+ }
+ 
+-fn doubao_multimodal_embedding_body(model: &str, text: &str) -> Value {
+-    json!({
++fn doubao_multimodal_embedding_body(
++    model: &str,
++    text: &str,
++    output_dimensionality: Option<f64>,
++) -> Value {
++    let mut body = json!({
+         "model": model,
+         "encoding_format": "float",
+         "input": [{ "type": "text", "text": text }],
+-    })
++    });
++    if let Some(dimensions) = output_dimensionality
++        .filter(|dim| dim.is_finite() && *dim >= 1.0)
++        .map(|dim| dim.floor() as u32)
++    {
++        body["dimensions"] = json!(dimensions);
++    }
++    body
+ }
+ 
+ pub fn build_snippet(content: &str, query: &str) -> String {
+@@ -1824,11 +1835,16 @@ mod tests {
+             "https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal?trace=1"
+         );
+ 
+-        let body = doubao_multimodal_embedding_body("doubao-embedding-vision", "hello");
++        let body = doubao_multimodal_embedding_body(
++            "doubao-embedding-vision",
++            "hello",
++            Some(1024.0),
++        );
+         assert_eq!(body["model"], "doubao-embedding-vision");
+         assert_eq!(body["encoding_format"], "float");
+         assert_eq!(body["input"][0]["type"], "text");
+         assert_eq!(body["input"][0]["text"], "hello");
++        assert_eq!(body["dimensions"], 1024);
+     }
+ 
+     #[test]
+@@ -1887,7 +1903,7 @@ mod tests {
+             "https://gateway.example.com/ark/embeddings/multimodal"
+         );
+ 
+-        let body = doubao_multimodal_embedding_body(&cfg.model, "hello");
++        let body = doubao_multimodal_embedding_body(&cfg.model, "hello", None);
+         assert_eq!(body["input"][0]["type"], "text");
+         assert_eq!(body["input"][0]["text"], "hello");
+     }
+diff --git a/src/lib/benchmark-bridge.ts b/src/lib/benchmark-bridge.ts
+index e6e182f..2e85fab 100644
+--- a/src/lib/benchmark-bridge.ts
++++ b/src/lib/benchmark-bridge.ts
+@@ -386,9 +386,7 @@ async function ingestRun(payload: Record<string, unknown>) {
+   const llmUsage = finishBenchmarkLlmTelemetry()
+   const rustUsage = await invoke<RustUsage>("benchmark_telemetry_finish", { stage })
+   if (operationError) throw operationError
+-  if (!llmUsage.complete || !rustUsage.complete) {
+-    throw new Error("Provider usage telemetry was incomplete during ingestion")
+-  }
++  const tokenUsageComplete = llmUsage.complete && rustUsage.complete
+   return {
+     status: "completed",
+     durationSeconds,
+@@ -398,6 +396,9 @@ async function ingestRun(payload: Record<string, unknown>) {
+       outputTokens: llmUsage.outputTokens + rustUsage.outputTokens,
+       embeddingTokens: rustUsage.embeddingTokens,
+     },
++    tokenUsageComplete,
++    llmTokenUsageComplete: llmUsage.complete,
++    embeddingTokenUsageComplete: rustUsage.complete,
+     reviewSweepCompleted: sweepCompleted,
+     finalBatch,
+     documentOffset,

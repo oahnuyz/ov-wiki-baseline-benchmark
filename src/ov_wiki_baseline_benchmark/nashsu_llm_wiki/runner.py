@@ -888,6 +888,19 @@ class BenchmarkRunner:
         if deletion is not None:
             report["Deletion Efficiency (Total Dataset)"] = {
                 "Total Deletion Time (s)": deletion.duration_seconds,
+                "Searchable Data Deletion Time (s)": deletion.payload.get(
+                    "searchableDeletionDurationSeconds", deletion.duration_seconds
+                ),
+                "Frontend Quiescence Time (s)": deletion.payload.get(
+                    "frontendCleanupDurationSeconds", 0.0
+                ),
+                "Post-Deletion Cleanup and Recovery Time (s)": deletion.payload.get(
+                    "postDeletionCleanupDurationSeconds", 0.0
+                ),
+                "Only Searchable Data Included In Primary Time": deletion.payload.get(
+                    "onlySearchableDataIncludedInPrimaryTime", False
+                ),
+                "Timed Deletion Scope": deletion.payload.get("timedDeletionScope", []),
                 "Total Input Tokens": deletion.usage.input_tokens,
                 "Total Output Tokens": deletion.usage.output_tokens,
                 "Total Embedding Tokens": deletion.usage.embedding_tokens,

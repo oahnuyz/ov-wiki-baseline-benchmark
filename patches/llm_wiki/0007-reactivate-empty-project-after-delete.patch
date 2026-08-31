@@ -1,0 +1,20 @@
+diff --git a/src/lib/benchmark-bridge.ts b/src/lib/benchmark-bridge.ts
+index 81714d0..29131d8 100644
+--- a/src/lib/benchmark-bridge.ts
++++ b/src/lib/benchmark-bridge.ts
+@@ -422,9 +422,12 @@ async function execute(request: BridgeRequest): Promise<unknown> {
+     return { cleared: true }
+   }
+   if (request.operation === "restore") {
+-    const project = requireActiveProject(request.payload.projectPath)
+-    const projectScaffold = await restoreGeneralScaffold(project.path)
+-    return { restored: true, projectScaffold }
++    const projectPath = normalizePath(String(request.payload.projectPath ?? ""))
++    if (!projectPath.startsWith("/")) throw new Error("Invalid benchmark projectPath")
++    const projectScaffold = await restoreGeneralScaffold(projectPath)
++    const project = await openProject(projectPath)
++    useWikiStore.getState().setProject(project)
++    return { restored: true, projectScaffold, projectId: project.id }
+   }
+   throw new Error(`Unsupported benchmark bridge operation: ${request.operation}`)
+ }

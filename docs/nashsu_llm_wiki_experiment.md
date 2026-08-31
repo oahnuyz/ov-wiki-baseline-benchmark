@@ -429,10 +429,11 @@ usage；被回滚尝试的时间和 token 不进入 `Total Insertion Time` 或
 - LLM output tokens：上述调用的 completion tokens；
 - embedding tokens：所有页面 chunk embedding 调用。
 
-不使用字符数估算。任何已发出的模型/embedding 请求如果没有可解析的 usage，整个入库请求
-标记为 telemetry incomplete，并使 benchmark 失败。Nashsu 原生 ingest queue 仍保留最多
-3 次任务重试和 embedding oversize 缩半重试；这些内部重试属于一次批次尝试，若最终成功，
-其时间和可报告 usage 均计入该成功尝试。如果内部重试最终因可重试网络错误耗尽，则由外层
+不使用字符数估算。某个成功的模型/embedding 请求如果没有可解析的 usage，该批仍完成，
+但标记为 telemetry incomplete；该批其他请求已返回的 usage 会原样返回并累计为已知下界，
+不会把整批改记为 0。Nashsu 原生 ingest queue 仍保留最多 3 次任务重试和 embedding
+oversize 缩半重试；这些内部重试属于一次批次尝试，若最终成功，其时间和所有可报告 usage
+均计入该成功尝试。如果内部重试最终因可重试网络错误耗尽，则由外层
 快照机制回滚整批，并从主要指标中排除整个失败批次尝试。
 
 ## 8. 第二轮：QA 问答轮
@@ -612,25 +613,26 @@ Judge 的 provider token 单独写入 `judge_telemetry.json`。它不计入“�
 
 ## 10. 删除轮
 
-一个共享 corpus 的所有实验变体完成 QA 与 Judge 后，只执行一次删除。计时从删除操作开始，
-覆盖前端内存状态清理和文件系统清理。
+一个共享 corpus 的所有实验变体完成 QA 与 Judge 后，只执行一次删除。删除分为计时前停写、
+可检索数据删除、计时后清理/恢复三段，主指标只采用中间一段。
 
-删除内容包括：
+主指标计时内容只有：
 
-- `wiki/` 生成页面；
-- `media/`；
-- `raw/parsed/`；
-- 本 run 的 `raw/sources/.benchmark-<run_id>/` staged corpus；
-- `.llm-wiki/` 下的 review、caption cache、ingest cache、向量/索引和其他运行状态。
+- `wiki/` 中除 `wiki/media/` 外的页面，也同时消除由页面关系产生的图候选；
+- 可被 `source.search` 访问的非隐藏 `raw/sources/` 数据；
+- `.llm-wiki/lancedb/` 中的页面和分块向量。
+
+queue/review/lint 的前端停写与清空在计时前完成。`wiki/media`、根 `media/`、`raw/parsed/`、
+隐藏 `.benchmark-*` staging、caption/ingest/review/lint 等缓存和其余 `.llm-wiki` 元数据在
+计时后清理。这些内容仍会被彻底删除，只是不属于可检索数据删除主指标。
 
 系统在删除前验证项目 ID 没有变化、项目路径为绝对安全路径，并且只操作 run 注册的专用
-项目。删除 `.llm-wiki/` 后恢复原项目的 `project.json`，以便下一 corpus 组复用同一项目。
-`purpose.md` 和 `schema.md` 不删除。
+项目。`purpose.md` 和 `schema.md` 不删除。
 
-删除整个 `wiki/` 也会删除初始 `index.md`、`overview.md` 和 `log.md`。为了保证第一个 corpus
-与后续 corpus 初始状态一致，下一 corpus 创建 run 时必须在入库计时开始前恢复官方 General
-脚手架；不能让第一次使用项目时存在占位文件、后续轮次却不存在。脚手架恢复属于实验环境
-初始化，不计入 corpus 入库时间，也不能携带上一 corpus 的任何内容。
+删除 Wiki 页面也会删除初始 `index.md`、`overview.md` 和 `log.md`。可检索页面、raw-source
+搜索数据和向量删除后立即停止主计时。此后才清理非检索状态、恢复 `project.json` 和官方
+General 脚手架并尝试重新打开项目；必要的 WebKit 重启也发生在计时外。这保证下一个
+corpus 的初始状态一致，同时不把停写、缓存清理或环境恢复时间算作删除时间。
 
 删除不调用 LLM 或 embedding，因此：
 
@@ -693,6 +695,11 @@ Total Insertion Token Cost
   = ingest_input_tokens + ingest_output_tokens + ingest_embedding_tokens
 ```
 
+每批都会返回并累计所有成功请求中已经获得的 provider usage。若该批仍有成功请求未返回
+usage，则 `Token Usage Complete=false`，精确的 `Total Insertion Token Cost` 记为 `null`，
+同时 `Known Input/Output/Embedding Tokens (Lower Bound)` 和
+`Known Insertion Token Cost (Lower Bound)` 保留并累加已知值；不会再把整批 Token 置为 0。
+
 文件 staging/copy 和批间服务重启不计入主指标。报告同时记录实际 operational wall clock、
 源文档数、批大小、批数、重启次数、`Ingest Concurrency=1`、
 `Includes Review Sweep=true` 和 `Review Sweep Count=1`。以 PaperScope 93 篇为例，默认形成
@@ -723,13 +730,17 @@ Total QA Token Cost
 ### 11.6 删除效率
 
 ```text
-Total Deletion Time = 清除前端状态和全部本轮持久化数据的墙钟时间
+Total Deletion Time = 删除当前 corpus 的可检索页面/raw-source 数据/向量的墙钟时间
 Total Deletion Token Cost = 0
 ```
 
-删除计时只覆盖活动 Nashsu 项目的正式清理。批次快照位于项目外，且通常在每批最终成功后
-立即删除；异常退出遗留的快照会在下次运行开始前清理。所有快照清理都发生在删除指标计时
-之外，其耗时只记为 `Snapshot Cleanup Time`，不进入 `Total Deletion Time`。
+报告另列 `Frontend Quiescence Time` 与 `Post-Deletion Cleanup and Recovery Time`。前者覆盖
+queue/review/lint 停写清理，后者覆盖 media、parsed、隐藏 staging、缓存/元数据、项目恢复和
+run registry 清理；两者都不进入 `Total Deletion Time`。必要的 WebKit 服务重启也在主指标外。
+
+批次快照位于项目外，且通常在每批最终成功后立即删除；异常退出遗留的快照会在下次运行
+开始前清理。所有快照清理也发生在删除指标计时之外，其耗时只记为
+`Snapshot Cleanup Time`。
 
 ## 12. 输出文件
 
@@ -768,7 +779,8 @@ Total Deletion Token Cost = 0
 - `maxContextSize` 不是官方默认 204800；
 - bridge 未报告 `top_k=5`；
 - embedding 返回向量维度不是 1024；
-- 入库或 QA 中任何已发出 provider 请求缺失真实 usage；
+- QA 中任何已发出 provider 请求缺失真实 usage；
+- 入库允许部分成功请求缺失 usage，但必须保留其他请求的已知 Token，并将完整性标为 false；
 - QA 返回空 answer 或缺少 session ID；
 - 删除产生任何非零模型/embedding token；
 - bridge token 缺失或错误；
@@ -780,14 +792,17 @@ Total Deletion Token Cost = 0
 模式与输入原则已经确定：官方 General 模板不做人工编辑、`mode=standard`、
 `retrievalMode=standard`，并且不增加 QA 动作硬限制。正式 PaperScope 实验启动前已完成：
 
-1. **服务器完整编译验证**：四个补丁可顺序应用；TypeScript typecheck、相关 Vitest、Rust
-   `cargo check`、Python 14 项单元测试和带 `tauri/custom-protocol` 的 Linux release 构建通过。
+1. **服务器完整编译验证**：七个补丁可顺序应用；TypeScript typecheck、相关 Vitest、Rust
+   定向测试、Python 20 项单元测试和带 `tauri/custom-protocol` 的 Linux release 构建通过。
 2. **重启续批 smoke test**：Xvfb/WebKit readiness、完整进程组重启、重启后
    `continuation=true` 的受保护脚手架校验均通过，未调用模型。
 3. **Agent trace 审计**：不增加动作 allowlist，也不强制至少一次检索。正式 QA 的逐题输出
    会记录工具序列；直接 final 或理论上的非检索动作保留为 Nashsu 官方行为，通过 trace 审计。
 4. **Recall 指标**：当前 Recall 为占位 0。若要比较检索质量，应定义基于 gold document IDs
    或 evidence 的 Recall@K，并确保 Nashsu trace 可以映射回标准文档。
+5. **Doubao 1024 维 smoke test**：真实 API 1024 维探针通过；临时 Wiki 页面写入返回
+   `vectorsWritten=1`，唯一短语检索返回 `mode=hybrid`、`tokenHits=1`、`vectorHits=1`，
+   测试 corpus 随后由正式删除接口清除。
 
 General 脚手架恢复、`outputLanguage=auto`、官方默认 chunk 参数和
 `persistExtractedMarkdown=false` 已由 bridge 固定并进入 manifest。Judge usage 缺失按已确认

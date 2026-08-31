@@ -160,6 +160,9 @@ Response:
     "searchInputTokens": 0,
     "searchOutputTokens": 0
   },
+  "tokenUsageComplete": false,
+  "llmTokenUsageComplete": false,
+  "embeddingTokenUsageComplete": true,
   "reviewSweepCompleted": true,
   "finalBatch": true,
   "documentOffset": 75,
@@ -168,8 +171,12 @@ Response:
 }
 ```
 
-One failed source, caption, embedding, or sweep fails the relevant request. The
-benchmark totals provider usage and active duration over every batch. Service
+One failed source, caption, embedding, or sweep fails the relevant request. A
+successfully completed batch always returns and accumulates every provider usage
+value that was observed. If one or more successful provider calls omit usage,
+`tokenUsageComplete` is false and the returned totals are a known lower bound;
+the batch is not discarded and its known totals are never replaced with zero.
+The benchmark totals provider usage and active duration over every batch. Service
 restart time is recorded separately as operational wall-clock overhead.
 
 ## `POST /runs/{runId}/qa`
@@ -199,10 +206,14 @@ Response:
 
 ## `POST /runs/{runId}/delete`
 
-Deletes all data created for the dedicated run, including generated Wiki pages,
-review state, extracted media, page/chunk embeddings, graph/index state, and raw
-staged copies. The timer covers the complete cleanup. It must reject any target
-outside the run's exact dedicated project path.
+Deletes all data created for the current corpus. The primary timer covers only
+retrieval-visible state: generated Wiki pages and their derived graph candidates,
+non-hidden raw sources addressable by `source.search`, and LanceDB page/chunk
+vectors. Frontend queue/review/lint quiescence happens before the timer. Media,
+hidden staging, parsed/caption/ingest/review/lint caches, remaining metadata,
+project reactivation, run-registry cleanup, and service recovery happen after it.
+Those two excluded phases are reported separately. The endpoint must reject any
+target outside the run's exact dedicated project path.
 
 Response:
 
@@ -210,6 +221,15 @@ Response:
 {
   "status": "completed",
   "durationSeconds": 0.5,
+  "searchableDeletionDurationSeconds": 0.5,
+  "frontendCleanupDurationSeconds": 0.1,
+  "postDeletionCleanupDurationSeconds": 0.2,
+  "onlySearchableDataIncludedInPrimaryTime": true,
+  "timedDeletionScope": [
+    "wiki-pages-and-derived-graph-data",
+    "non-hidden-raw-source-search-data",
+    "lancedb-page-and-chunk-vectors"
+  ],
   "usage": {
     "inputTokens": 0,
     "outputTokens": 0,

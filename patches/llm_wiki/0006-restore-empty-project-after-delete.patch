@@ -1,0 +1,46 @@
+diff --git a/src-tauri/src/api_server.rs b/src-tauri/src/api_server.rs
+index be3e824..f10bd63 100644
+--- a/src-tauri/src/api_server.rs
++++ b/src-tauri/src/api_server.rs
+@@ -2406,6 +2406,17 @@ fn handle_benchmark_delete(app: &AppHandle, run_id: &str) -> ApiResponse {
+     {
+         return err(500, format!("Failed to restore dedicated project identity: {error}"));
+     }
++    // This is deliberately after deletion_duration_seconds was captured:
++    // recreating a reusable empty project is operational recovery, not corpus
++    // deletion work.
++    if let Err(error) = benchmark::dispatch_frontend(
++        app,
++        "restore",
++        json!({ "runId": run.id.clone(), "projectPath": run.project.path.clone() }),
++        Duration::from_secs(30),
++    ) {
++        return err(500, error);
++    }
+     if let Ok(mut runs) = benchmark_runs().lock() {
+         runs.remove(run_id);
+     } else {
+diff --git a/src/lib/benchmark-bridge.ts b/src/lib/benchmark-bridge.ts
+index 2e85fab..81714d0 100644
+--- a/src/lib/benchmark-bridge.ts
++++ b/src/lib/benchmark-bridge.ts
+@@ -92,7 +92,7 @@ const GENERAL_STRUCTURAL_FILES = new Set([
+ 
+ interface BridgeRequest {
+   requestId: string
+-  operation: "create" | "ingest" | "delete"
++  operation: "create" | "ingest" | "delete" | "restore"
+   payload: Record<string, unknown>
+ }
+ 
+@@ -418,5 +418,10 @@ async function execute(request: BridgeRequest): Promise<unknown> {
+     useLintStore.getState().setItems([])
+     return { cleared: true }
+   }
++  if (request.operation === "restore") {
++    const project = requireActiveProject(request.payload.projectPath)
++    const projectScaffold = await restoreGeneralScaffold(project.path)
++    return { restored: true, projectScaffold }
++  }
+   throw new Error(`Unsupported benchmark bridge operation: ${request.operation}`)
+ }

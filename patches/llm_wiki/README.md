@@ -21,6 +21,18 @@ git apply --check /path/to/patches/llm_wiki/0003-webkit-request-timeout-fallback
 git apply /path/to/patches/llm_wiki/0003-webkit-request-timeout-fallback.patch
 git apply --check /path/to/patches/llm_wiki/0004-restart-safe-batched-ingest.patch
 git apply /path/to/patches/llm_wiki/0004-restart-safe-batched-ingest.patch
+
+git apply --check /path/to/patches/llm_wiki/0005-partial-ingest-usage-and-doubao-dimensions.patch
+git apply /path/to/patches/llm_wiki/0005-partial-ingest-usage-and-doubao-dimensions.patch
+
+git apply --check /path/to/patches/llm_wiki/0006-restore-empty-project-after-delete.patch
+git apply /path/to/patches/llm_wiki/0006-restore-empty-project-after-delete.patch
+
+git apply --check /path/to/patches/llm_wiki/0007-reactivate-empty-project-after-delete.patch
+git apply /path/to/patches/llm_wiki/0007-reactivate-empty-project-after-delete.patch
+
+git apply --check /path/to/patches/llm_wiki/0008-searchable-only-deletion-telemetry.patch
+git apply /path/to/patches/llm_wiki/0008-searchable-only-deletion-telemetry.patch
 ```
 
 `0001` makes the approved model settings enforceable on both the TypeScript ingest
@@ -60,8 +72,24 @@ policy.
 - the final batch performs exactly one review sweep;
 - deletion removes staging directories created by every continuation run.
 
+`0005` preserves all provider-reported ingest usage even when some calls omit
+usage, sends the configured 1024-dimensional request to Doubao multimodal
+embeddings, and excludes reusable-project recovery work from deletion timing.
+
+`0006` restores the empty General scaffold after that deletion timer has stopped,
+so a subsequent WebKit restart can reopen the dedicated project without adding
+project recovery time to the deletion metric.
+
+`0007` reopens the recovered empty project in the frontend after deletion. The
+runner still restarts the service at the next formal experiment boundary because
+WebKit file-watch events can subsequently clear the in-memory active project.
+
+`0008` narrows primary deletion timing to Wiki/graph pages, non-hidden raw-source
+search data, and LanceDB vectors. Frontend quiescence plus non-searchable cleanup
+and project recovery are reported separately for audit.
+
 The benchmark runner does not accept the stock LLM Wiki API as a benchmark bridge.
 Stock `AgentUsage` reports character counts, not provider tokens, and the stock API
 does not expose an atomic ingest-plus-review-sweep operation. Apply the patches to
 obtain the bridge specified in [`bridge_contract.md`](bridge_contract.md); the runner
-never substitutes character estimates. Apply all four patches in order.
+never substitutes character estimates. Apply all eight patches in order.
