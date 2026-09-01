@@ -146,14 +146,26 @@ class TencentDBRunner:
 
     def _run_ingest(self, experiment: PreparedTencentExperiment, wiki_id: str, group_dir: Path, manifest: dict[str, Any], ledger: CallLedger, client: MemoryKnowledgeClient, retry_failed: bool) -> None:
         started = time.perf_counter()
+        log_offset = manifest.get("ingest_log_offset")
+        if log_offset is None and self.config.service_log_path is not None:
+            try:
+                log_offset = self.config.service_log_path.stat().st_size
+            except OSError:
+                log_offset = 0
+            manifest["ingest_log_offset"] = log_offset
         prior = {str(x.get("source")): x for x in manifest.get("documents", [])}
+        service_failures = self._service_failed_sources(int(manifest.get("ingest_log_offset", 0)))
         if prior and len(prior) == len(experiment.documents) and all(
             item.get("status") == "uploaded" for item in prior.values()
-        ):
+        ) and not service_failures:
             # A completed ingest round is idempotent. Do not perturb the
             # measured insertion wall clock on a no-op resume.
             manifest["documents"] = [prior[str(document["id"])] for document in experiment.documents]
             return
+        if service_failures:
+            for record in prior.values():
+                if str(record.get("source", "")) in service_failures:
+                    record["status"] = "ingest_failed"
         converted: list[dict[str, str]] = []
         records: list[dict[str, Any]] = []
         for document, path in zip(experiment.documents, experiment.document_paths):
@@ -166,11 +178,14 @@ class TencentDBRunner:
                 # explicitly requested for PDFs.
                 old = {**old, "status": "conversion_failed"}
                 prior_status = "conversion_failed"
-            if prior_status in {"uploaded", "upload_failed", "conversion_failed"} and not (
+            if prior_status in {"uploaded", "upload_failed", "conversion_failed", "ingest_failed"} and not (
                 retry_failed and prior_status == "conversion_failed" and path.suffix.lower() == ".pdf"
             ):
-                records.append(old)
-                continue
+                if prior_status == "ingest_failed":
+                    pass
+                else:
+                    records.append(old)
+                    continue
             if prior_status == "converted":
                 # Compatibility with manifests produced by the first draft.
                 records.append(prior[key])
@@ -216,34 +231,83 @@ class TencentDBRunner:
             manifest["documents"] = list(records)
             self._write_json(group_dir / "manifest.json", {**manifest, "status": "uploading"})
         if converted:
-            try:
-                self._service(
-                    ledger,
-                    "ingest",
-                    "wiki.ingest",
-                    client.ingest,
-                    wiki_id,
-                    experiment_id=experiment.spec.id,
-                )
-                detail = self._service(
-                    ledger,
-                    "ingest",
-                    "wiki.wait_ready",
-                    client.wait_ready,
-                    wiki_id,
-                    experiment_id=experiment.spec.id,
-                )
-                manifest["wiki_status"] = detail.get("status")
-                if detail.get("status") != "ready":
-                    manifest["ingest_error"] = f"wiki ended in status {detail.get('status')}"
-            except Exception as exc:
-                manifest["ingest_error"] = str(exc)
+            by_source_files = {}
+            for item in converted:
+                by_source_files.setdefault(item["source"], []).append(item)
+            retry_sources = set(by_source_files)
+            failed_sources_final: set[str] = set()
+            attempts = []
+            for attempt in range(1, self.config.max_ingest_attempts + 1):
+                if attempt > 1:
+                    retry_files = [item for source in sorted(retry_sources) for item in by_source_files[source]]
+                    try:
+                        self._service(ledger, "ingest", "wiki.raw.write.retry", client.raw_write, wiki_id,
+                                      [{"filename": x["filename"], "content": x["content"]} for x in retry_files],
+                                      experiment_id=experiment.spec.id, token_bearing=False)
+                    except Exception as exc:
+                        attempts.append({"attempt": attempt, "status": "raw_write_failed", "sources": sorted(retry_sources), "error": str(exc)})
+                        continue
+                try:
+                    attempt_log_offset = self._service_log_size()
+                    self._service(ledger, "ingest", "wiki.ingest", client.ingest, wiki_id, experiment_id=experiment.spec.id)
+                    detail = self._service(ledger, "ingest", "wiki.wait_ready", client.wait_ready, wiki_id, experiment_id=experiment.spec.id)
+                    manifest["wiki_status"] = detail.get("status")
+                    failed_sources = self._service_failed_sources(attempt_log_offset)
+                    retry_sources = retry_sources & failed_sources
+                    failed_sources_final = set(retry_sources)
+                    attempts.append({"attempt": attempt, "status": "ready" if detail.get("status") == "ready" else "not_ready", "failed_sources": sorted(retry_sources)})
+                    if not retry_sources or attempt == self.config.max_ingest_attempts:
+                        if detail.get("status") != "ready":
+                            manifest["ingest_error"] = f"wiki ended in status {detail.get('status')}"
+                        break
+                except Exception as exc:
+                    attempts.append({"attempt": attempt, "status": "failed", "sources": sorted(retry_sources), "error": str(exc)})
+                    failed_sources_final = set(retry_sources)
+            for record in records:
+                if record["source"] in failed_sources_final:
+                    record["status"] = "ingest_failed"
+                    record["error"] = "MemoryKnowledge did not generate a legal wiki page after maximum attempts"
+                elif record.get("status") == "ingest_failed":
+                    record["status"] = "uploaded"
+                    record["error"] = None
+            manifest["ingest_attempts"] = attempts
         manifest["documents"] = records
         manifest["partial_ingest"] = any(r.get("status") != "uploaded" for r in records) or bool(manifest.get("ingest_error"))
         attempt_seconds = time.perf_counter() - started
         previous_seconds = float(manifest.get("ingest", {}).get("time_seconds", 0.0))
         manifest["ingest"] = {"time_seconds": previous_seconds + attempt_seconds, "last_attempt_seconds": attempt_seconds, "documents_total": len(records), "documents_failed": sum(r.get("status") != "uploaded" for r in records), "source": "raw_conversion_start_to_ready"}
         self._write_json(group_dir / "manifest.json", manifest)
+
+    def _service_failed_sources(self, offset: int = 0) -> set[str]:
+        """Read source-level generation failures when the service log is available."""
+        path = self.config.service_log_path
+        if path is None or not path.is_file():
+            return set()
+        import re
+        failures: set[str] = set()
+        try:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                text = handle.read().decode("utf-8", errors="replace")
+            for line in text.splitlines():
+                if "runIngest 单源抽取失败" not in line and "未生成任何合法 wiki 页" not in line:
+                    continue
+                match = re.search(r'"source":"([^"]+)"', line)
+                if match:
+                    source = match.group(1)
+                    failures.add(source[:-3] if source.endswith(".md") else source)
+        except OSError:
+            return set()
+        return failures
+
+    def _service_log_size(self) -> int:
+        path = self.config.service_log_path
+        if path is None:
+            return 0
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
 
     def _run_qa(self, experiment: PreparedTencentExperiment, wiki_id: str, group_dir: Path, ledger: CallLedger, client: MemoryKnowledgeClient) -> None:
         tools: list[dict[str, Any]] = []

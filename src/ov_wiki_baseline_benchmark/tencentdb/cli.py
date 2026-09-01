@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 from ..specs import load_specs, repository_root
@@ -18,6 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", default=str(root / "baseline_configs" / "tencentdb_agent_memory.yaml"))
     parser.add_argument("--round", choices=["all", "ingest", "qa", "judge", "delete"], default="all")
     parser.add_argument("--retry-failed-pdfs", action="store_true")
+    parser.add_argument("--service-log", help="MemoryKnowledge service log for source-level ingest retries")
     args = parser.parse_args(argv)
     specs = load_specs()
     unknown = sorted(set(args.experiments) - set(specs))
@@ -25,6 +27,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"unknown experiments: {unknown}")
     data_dir = Path(args.data_dir).expanduser().resolve()
     config = TencentDBConfig.from_yaml(Path(args.config).expanduser().resolve())
+    if args.service_log:
+        config = replace(config, service_log_path=Path(args.service_log).expanduser().resolve())
     prepared = [PreparedTencentExperiment.load(specs[e], data_dir) for e in args.experiments]
     runner = TencentDBRunner(config, answer_prompt_path=root / "prompts" / "ov_wiki_bot_answer.txt", judge_prompt_path=root / "prompts" / "generic_llm_judge_user.txt")
     # Multiple variants sharing a corpus are ingested once and QA'd independently.

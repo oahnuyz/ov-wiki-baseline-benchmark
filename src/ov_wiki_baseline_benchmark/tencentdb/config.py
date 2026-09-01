@@ -27,6 +27,8 @@ class TencentDBConfig:
     judge_workers: int = 1
     max_loop_turns: int = 15
     raw_max_bytes: int = 512 * 1024
+    service_log_path: Path | None = None
+    max_ingest_attempts: int = 3
 
     @classmethod
     def from_yaml(cls, path: Path) -> "TencentDBConfig":
@@ -52,11 +54,15 @@ class TencentDBConfig:
             qa_workers=_positive_int(execution, "qa_workers", 1),
             judge_workers=_positive_int(execution, "judge_workers", 1),
             max_loop_turns=_positive_int(execution, "max_loop_turns", 15),
+            service_log_path=(Path(str(execution["service_log_path"])).expanduser() if execution.get("service_log_path") else None),
+            max_ingest_attempts=_positive_int(execution, "max_ingest_attempts", 3),
         )
         if cfg.max_loop_turns != 15:
             raise ValueError("TencentDB baseline fixes max_loop_turns to 15")
         if cfg.poll_interval_seconds <= 0:
             raise ValueError("poll_interval_seconds must be positive")
+        if cfg.max_ingest_attempts > 3:
+            raise ValueError("max_ingest_attempts cannot exceed 3")
         return cfg
 
     def api_key(self) -> str:
@@ -94,6 +100,8 @@ class TencentDBConfig:
             "judge_workers": self.judge_workers,
             "max_loop_turns": self.max_loop_turns,
             "retrieval": "TencentDB default parameters",
+            "max_ingest_attempts": self.max_ingest_attempts,
+            "service_log_path_configured": self.service_log_path is not None,
         }
 
 
