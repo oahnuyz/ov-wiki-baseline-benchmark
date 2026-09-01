@@ -817,6 +817,11 @@ run registry 清理；两者都不进入 `Total Deletion Time`。必要的 WebKi
 - headless bridge listener 或指定项目在 300 秒内未就绪；
 - headless 项目目录非空但不是有效 LLM Wiki 项目。
 
+入库中若模型生成的 Wiki `FILE` 块被截断，LLM Wiki 会先执行其内置单文件修复；若仍报告
+`truncated wiki file(s) could not be repaired`，runner 将其视为可重试批次错误：丢弃该次
+时间与未知 Token、恢复批次前快照、重启服务并完整重跑当前批次，最多沿用
+`max_batch_retries=2`。这不把不完整页面当作成功入库结果。
+
 ## 14. 部署验证状态与结果解释限制
 
 模式与输入原则已经确定：官方 General 模板不做人工编辑、`mode=standard`、

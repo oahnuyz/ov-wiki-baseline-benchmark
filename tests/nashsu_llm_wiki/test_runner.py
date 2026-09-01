@@ -29,6 +29,7 @@ class FakeBridge:
         self,
         *,
         fail_first_ingest: bool = False,
+        first_ingest_error_detail: str = "Generation failed: error sending request for url",
         fail_first_qa: bool = False,
         incomplete_telemetry_offsets: set[int] | None = None,
     ) -> None:
@@ -41,6 +42,7 @@ class FakeBridge:
         self.restart_count = 0
         self.stop_count = 0
         self.failures_remaining = 1 if fail_first_ingest else 0
+        self.first_ingest_error_detail = first_ingest_error_detail
         self.qa_failures_remaining = 1 if fail_first_qa else 0
         self.incomplete_telemetry_offsets = set(incomplete_telemetry_offsets or set())
 
@@ -91,7 +93,7 @@ class FakeBridge:
             )
             raise BridgeRequestError(
                 status_code=500,
-                detail="Generation failed: error sending request for url",
+                detail=self.first_ingest_error_detail,
             )
         if document_offset in self.incomplete_telemetry_offsets:
             self.incomplete_telemetry_offsets.remove(document_offset)
@@ -357,6 +359,48 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(insertion["Batch Retry Count"], 1)
             self.assertIsNone(insertion["Discarded Retry Token Usage"])
             self.assertFalse(insertion["Snapshot Cleanup Included In Deletion Time"])
+
+    def test_unrepaired_truncated_wiki_file_retries_the_entire_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            experiment = _prepared_experiment(root)
+            project = root / "project"
+            project.mkdir()
+            (project / "marker.txt").write_text("clean", encoding="utf-8")
+            bridge = FakeBridge(
+                fail_first_ingest=True,
+                first_ingest_error_detail=(
+                    "Benchmark ingestion failed for 1 source(s): Ingest incomplete: "
+                    "1 truncated wiki file(s) could not be repaired: "
+                    "wiki/concepts/incomplete.md"
+                ),
+            )
+            runner = BenchmarkRunner(
+                _config(root),
+                answer_prompt_path=repository_root()
+                / "prompts"
+                / "ov_wiki_bot_answer.txt",
+                judge_prompt_path=repository_root()
+                / "prompts"
+                / "generic_llm_judge_user.txt",
+                bridge=bridge,
+                judge=FakeJudge(),
+            )
+
+            manifest = runner.run_group(
+                [experiment],
+                skip_deletion=True,
+            )
+
+            self.assertEqual(
+                bridge.ingest_calls,
+                [(0, False, 1), (0, False, 1), (1, True, 1)],
+            )
+            self.assertEqual(bridge.stop_count, 1)
+            self.assertEqual(bridge.restart_count, 2)
+            self.assertFalse((project / "partial-write.txt").exists())
+            self.assertEqual(manifest["status"], "completed_without_deletion")
+            self.assertTrue(manifest["discarded_ingest_attempts"][0]["retryable"])
 
     def test_incomplete_ingest_usage_preserves_and_sums_known_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as name:

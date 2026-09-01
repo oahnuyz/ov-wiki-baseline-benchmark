@@ -399,7 +399,7 @@ class BenchmarkRunner:
                             ] = list(accepted_incomplete_records)
                             self._write_group_manifest(corpus_id, group_manifest)
                             break
-                        retryable = exc.retryable_transport_failure
+                        retryable = _is_retryable_ingest_error(exc)
                         retry_record = {
                             "batch_index": batch_index,
                             "attempt": attempt + 1,
@@ -1119,6 +1119,12 @@ def _is_incomplete_ingest_telemetry(error: BridgeRequestError) -> bool:
     return (
         error.detail
         == "Provider usage telemetry was incomplete during ingestion"
+    )
+
+
+def _is_retryable_ingest_error(error: BridgeRequestError) -> bool:
+    return error.retryable_transport_failure or (
+        "truncated wiki file(s) could not be repaired" in error.detail.lower()
     )
 
 

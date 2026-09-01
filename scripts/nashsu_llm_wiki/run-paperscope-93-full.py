@@ -23,7 +23,7 @@ EXPERIMENT_IDS = [
 DATA_ROOT = Path("/noraiddata/ZhangYunhao/ov-wiki-benchmark-data")
 OUTPUT_ROOT = Path.home() / (
     "nashsu-llm-wiki-baseline/results/"
-    "paperscope_93_rerun_20260901_v4_15_retrievals_no_delete"
+    "paperscope_93_rerun_20260901_v5_15_retrievals_no_delete"
 )
 
 
