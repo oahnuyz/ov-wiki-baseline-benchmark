@@ -29,6 +29,7 @@ class FakeBridge:
         self,
         *,
         fail_first_ingest: bool = False,
+        fail_first_qa: bool = False,
         incomplete_telemetry_offsets: set[int] | None = None,
     ) -> None:
         self.prompts: list[str] = []
@@ -40,6 +41,7 @@ class FakeBridge:
         self.restart_count = 0
         self.stop_count = 0
         self.failures_remaining = 1 if fail_first_ingest else 0
+        self.qa_failures_remaining = 1 if fail_first_qa else 0
         self.incomplete_telemetry_offsets = set(incomplete_telemetry_offsets or set())
 
     def wait_until_ready(self, project_path: Path) -> None:
@@ -109,6 +111,9 @@ class FakeBridge:
     def answer(self, run_id: str, *, prompt: str, session_id: str) -> QaResult:
         self.prompts.append(prompt)
         self.sessions.append(session_id)
+        if self.qa_failures_remaining:
+            self.qa_failures_remaining -= 1
+            raise BridgeRequestError(status_code=None, detail="Read timed out")
         return QaResult(
             answer="Padella",
             session_id=session_id,
@@ -143,6 +148,41 @@ class FakeJudge:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_retryable_qa_failure_restarts_and_excludes_failed_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            experiment = _prepared_experiment(root)
+            (root / "project").mkdir()
+            config = _config(root)
+            bridge = FakeBridge(fail_first_qa=True)
+            runner = BenchmarkRunner(
+                config,
+                answer_prompt_path=repository_root() / "prompts" / "ov_wiki_bot_answer.txt",
+                judge_prompt_path=repository_root() / "prompts" / "generic_llm_judge_user.txt",
+                bridge=bridge,
+                judge=FakeJudge(),
+            )
+
+            manifest = runner.run_group([experiment])
+
+            self.assertEqual(manifest["qa_retry_count"], 1)
+            self.assertTrue(manifest["qa_retry_failed_time_excluded"])
+            self.assertTrue(manifest["qa_retry_failed_tokens_excluded"])
+            self.assertEqual(bridge.restart_count, 2)  # one ingest boundary + one QA recovery
+            audit = json.loads(
+                (
+                    root
+                    / "output"
+                    / "fixture"
+                    / "wiki"
+                    / "qa_retry_audit.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(audit), 1)
+            self.assertTrue(audit[0]["excluded_from_primary_qa_metrics"])
+            self.assertIsNone(audit[0]["failed_attempt_token_usage"])
+            self.assertEqual(audit[0]["replacement_run_id"], "run-3")
+
     def test_full_group_writes_aligned_metrics_and_isolated_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)

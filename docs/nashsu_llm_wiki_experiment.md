@@ -15,14 +15,20 @@
   2. `patches/llm_wiki/0002-benchmark-bridge-and-telemetry.patch`
   3. `patches/llm_wiki/0003-webkit-request-timeout-fallback.patch`
   4. `patches/llm_wiki/0004-restart-safe-batched-ingest.patch`
+  5. `patches/llm_wiki/0005-partial-ingest-usage-and-doubao-dimensions.patch`
+  6. `patches/llm_wiki/0006-restore-empty-project-after-delete.patch`
+  7. `patches/llm_wiki/0007-reactivate-empty-project-after-delete.patch`
+  8. `patches/llm_wiki/0008-searchable-only-deletion-telemetry.patch`
+  9. `patches/llm_wiki/0009-benchmark-qa-json-trace.patch`
 - Python 实验入口：`ov-wiki-nashsu`
 - 固定配置：`baseline_configs/nashsu_llm_wiki.yaml`
 
 `0001` 负责 Volcengine 关闭深度思考的请求格式以及 1024 维 embedding 的强校验；
 `0002` 增加只用于 benchmark 的本地控制接口、真实 token telemetry、完整入库等待、
 独立 QA 和定向清理能力；`0003` 为旧 WebKitGTK 补齐单次 provider 请求 timeout；`0004`
-增加分批 drain、受校验的跨重启续批和跨 run staging 清理。补丁不替换 Nashsu 的知识生成、
-Agent 或检索算法。
+增加分批 drain、受校验的跨重启续批和跨 run staging 清理；`0005`–`0008` 完善部分 token、
+1024 维 embedding 与删除边界；`0009` 只在 benchmark Agent 决策中请求严格 JSON，并把实时
+QA 事件落盘。补丁不替换 Nashsu 的知识生成、Agent 或检索算法。
 
 ## 2. 两类 token：bridge token 与 Ark API key
 
@@ -171,6 +177,8 @@ runner 将一个实验全部文档的 `sha256` 排序后串联，再计算 corpu
 | 网络失败批次重试 | 非负整数 | 最多 `2` 次 | Nashsu 内部重试耗尽后，恢复批前快照并整批重跑 |
 | 批次快照目录 | 项目外路径 | `~/nashsu-llm-wiki-baseline/snapshots` | 不参与检索，正常/失败/中止时清理 |
 | QA worker | 可并行 | `1` | 逐题串行 |
+| 单题 QA timeout | 正整数 | `600` 秒 | 仅限制一次问答 HTTP 尝试，不改变 Agent 内部 8 轮预算 |
+| 单题 QA 自动重试 | 非负整数 | 最多 `2` 次 | 仅网络/timeout/QA usage 不完整时重启服务并用新会话重答当前题 |
 | Judge worker | 可并行 | `1` | 逐题串行，与参考 baseline 对齐 |
 | PDF 解析 | 内置 / MinerU Cloud / MinerU Local | 内置 | MinerU 强制关闭 |
 | 图片 caption | 开/关、主模型/独立模型 | 开，复用主 LLM | caption 并发数固定为 4 |
@@ -182,7 +190,7 @@ runner 将一个实验全部文档的 `sha256` 排序后串联，再计算 corpu
 | parsed Markdown 副本 | 开/关 | 关 | 固定 `persistExtractedMarkdown=false` |
 | headless 启动 | 可见桌面 / 隐藏 WebView | 隐藏 WebView | Xvfb 中保留官方前端入库链路，不需要人工点击 |
 | startup timeout | 可配置 | `300` 秒 | runner 等待 bridge 和专用项目就绪；不计入实验时间 |
-| bridge timeout | 可配置 | `129600` 秒（36 小时） | 对单批入库或单次 QA/Judge HTTP 请求的上限，不是整个 corpus 的总时限 |
+| bridge timeout | 可配置 | `129600` 秒（36 小时） | 用于长入库请求；单题 QA 使用独立的 600 秒上限 |
 
 ### 5.2 Agent mode 与 retrieval mode 是两个独立参数
 
@@ -551,6 +559,10 @@ Agent prompt 会组合：
 `{"action":"final","answer":"..."}`，bridge 提取 answer。主模型、temperature、thinking 和
 非流式设置与入库轮一致。
 
+为降低 Agent action 被截断或附带非 JSON 文本的概率，benchmark 激活时会在 Agent 的结构化
+决策请求中加入 OpenAI-compatible `response_format={"type":"json_object"}`。该设置不作用于
+普通非 benchmark 会话，也不改变最终用户回答内容的格式。
+
 ### 8.5 QA 时间与 token
 
 单题 `durationSeconds` 从 Rust Agent 调用前开始，到最终 answer 和 provider usage 收集完成后
@@ -571,6 +583,16 @@ QA token 分为：
 - `searchInputTokens` / `searchOutputTokens`：为兼容参考 baseline 保留的独立搜索 LLM 槽位；
   Nashsu 当前混合检索没有独立 search LLM，因此这两个值为 0；
 - `embeddingTokens`：检索 query embedding usage。
+
+每个 Agent 事件还会立即追加并 flush 到项目下的
+`.llm-wiki/benchmark-traces/<run-id>/<session-id>.jsonl`。其中包含每轮 `llm.generate` 的开始、
+结束及工具事件，所以即使请求超时或进程被停止，也能判断卡在哪一轮。成功 QA 的路径写入
+逐题结果 `trace_log_path`。
+
+若单题发生网络错误、HTTP timeout，或 QA provider usage 不完整，runner 最多自动恢复两次：
+停止并重启服务、创建同 corpus 的 continuation run，然后以全新 `sessionId` 重答当前题。
+失败尝试的墙钟时间、恢复时间和未知 token 不进入正式平均 QA 时间/Token；它们单独写入
+`qa_retry_audit.json`。成功尝试仍必须有完整真实 usage，否则不会被计入正式结果。
 
 ## 9. 第三轮：评测轮
 
@@ -779,7 +801,7 @@ run registry 清理；两者都不进入 `Total Deletion Time`。必要的 WebKi
 - `maxContextSize` 不是官方默认 204800；
 - bridge 未报告 `top_k=5`；
 - embedding 返回向量维度不是 1024；
-- QA 中任何已发出 provider 请求缺失真实 usage；
+- QA 中任何已发出 provider 请求缺失真实 usage；该次尝试可按上述策略恢复，但不作为成功样本；
 - 入库允许部分成功请求缺失 usage，但必须保留其他请求的已知 Token，并将完整性标为 false；
 - QA 返回空 answer 或缺少 session ID；
 - 删除产生任何非零模型/embedding token；

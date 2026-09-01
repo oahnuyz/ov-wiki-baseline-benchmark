@@ -18,6 +18,7 @@ class ClientReadinessTests(unittest.TestCase):
             bridge_base_url="http://127.0.0.1:19828",
             startup_timeout_seconds=2,
             request_timeout_seconds=30,
+            qa_timeout_seconds=7,
             service_restart_command=("restart-service",),
             service_stop_command=("stop-service",),
             bridge_token=lambda: "bridge-token",
@@ -121,6 +122,28 @@ class ClientReadinessTests(unittest.TestCase):
             with self.assertRaises(BridgeRequestError) as raised:
                 self._client()._request("POST", "/runs/1/ingest", {})
         self.assertTrue(raised.exception.retryable_transport_failure)
+
+    def test_answer_uses_the_shorter_per_question_timeout(self) -> None:
+        client = self._client()
+        response = {
+            "status": "completed",
+            "answer": "Padella",
+            "sessionId": "session-1",
+            "durationSeconds": 1.0,
+            "resolvedTopK": 5,
+            "usage": {
+                "inputTokens": 4,
+                "outputTokens": 2,
+                "embeddingTokens": 1,
+                "agentInputTokens": 4,
+                "agentOutputTokens": 2,
+                "searchInputTokens": 0,
+                "searchOutputTokens": 0,
+            },
+        }
+        with patch.object(client, "_request", return_value=response) as request:
+            client.answer("run-1", prompt="Question", session_id="session-1")
+        self.assertEqual(request.call_args.kwargs["timeout_seconds"], 7)
 
 
 if __name__ == "__main__":

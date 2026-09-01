@@ -196,12 +196,15 @@ class BenchmarkRunner:
                 group_manifest["active_experiment"] = experiment.spec.id
                 group_manifest["completed_answers"] = len(existing_records)
                 self._write_group_manifest(corpus_id, group_manifest)
-                records = self._run_qa(
+                records, run_id = self._run_qa(
                     experiment,
                     run_id,
                     ingestion,
+                    corpus_id=corpus_id,
+                    group_manifest=group_manifest,
                     existing_records=existing_records,
                 )
+                group_manifest["run_id"] = run_id
                 group_manifest["status"] = "judging"
                 group_manifest["completed_answers"] = len(records)
                 group_manifest["completed_judgements"] = sum(
@@ -584,13 +587,84 @@ class BenchmarkRunner:
         run_id: str,
         ingestion: StageResult,
         *,
+        corpus_id: str,
+        group_manifest: dict[str, Any],
         existing_records: list[dict[str, Any]] | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], str]:
         records = list(existing_records or [])
+        retry_audit_path = self._experiment_output(experiment.spec.id) / "qa_retry_audit.json"
+        retry_audit: list[dict[str, Any]] = []
+        if retry_audit_path.exists():
+            saved_audit = json.loads(retry_audit_path.read_text(encoding="utf-8"))
+            if not isinstance(saved_audit, list):
+                raise ValueError(f"Invalid QA retry audit: {retry_audit_path}")
+            retry_audit = saved_audit
         for index, qa in enumerate(experiment.qas[len(records) :], start=len(records)):
-            session_id = f"benchmark-{experiment.spec.id}-{index}-{uuid.uuid4().hex}"
             prompt = self.answer_prompt.format(question=qa["question"])
-            result = self.bridge.answer(run_id, prompt=prompt, session_id=session_id)
+            retry_count = 0
+            while True:
+                session_id = f"benchmark-{experiment.spec.id}-{index}-{uuid.uuid4().hex}"
+                attempt_started = time.monotonic()
+                try:
+                    result = self.bridge.answer(
+                        run_id,
+                        prompt=prompt,
+                        session_id=session_id,
+                    )
+                    break
+                except BridgeRequestError as error:
+                    failed_duration = time.monotonic() - attempt_started
+                    if (
+                        not _is_retryable_qa_error(error)
+                        or retry_count >= self.config.max_qa_retries
+                    ):
+                        raise
+                    retry_count += 1
+                    audit_entry: dict[str, Any] = {
+                        "sample_id": qa["id"],
+                        "question_index": index,
+                        "failed_attempt": retry_count,
+                        "session_id": session_id,
+                        "run_id": run_id,
+                        "error": str(error),
+                        "failed_attempt_wall_clock_seconds": failed_duration,
+                        "failed_attempt_token_usage": None,
+                        "failed_attempt_token_usage_complete": False,
+                        "excluded_from_primary_qa_metrics": True,
+                    }
+                    recovery_started = time.monotonic()
+                    try:
+                        self.bridge.restart_service(self.config.project_path)
+                        replacement = self.bridge.create_run(
+                            corpus_id=corpus_id,
+                            project_path=self.config.project_path,
+                            continuation=True,
+                        )
+                    except BaseException as recovery_error:
+                        audit_entry["recovery_error"] = str(recovery_error)
+                        audit_entry["recovery_wall_clock_seconds"] = (
+                            time.monotonic() - recovery_started
+                        )
+                        retry_audit.append(audit_entry)
+                        _write_json(retry_audit_path, retry_audit)
+                        raise
+                    run_id = replacement.run_id
+                    audit_entry["replacement_run_id"] = run_id
+                    audit_entry["recovery_wall_clock_seconds"] = (
+                        time.monotonic() - recovery_started
+                    )
+                    retry_audit.append(audit_entry)
+                    _write_json(retry_audit_path, retry_audit)
+                    run_ids = group_manifest.setdefault("run_ids", [])
+                    if run_id not in run_ids:
+                        run_ids.append(run_id)
+                    group_manifest["run_id"] = run_id
+                    group_manifest["qa_retry_count"] = int(
+                        group_manifest.get("qa_retry_count", 0)
+                    ) + 1
+                    group_manifest["qa_retry_failed_time_excluded"] = True
+                    group_manifest["qa_retry_failed_tokens_excluded"] = True
+                    self._write_group_manifest(corpus_id, group_manifest)
             records.append(
                 {
                     "_global_index": index,
@@ -611,6 +685,7 @@ class BenchmarkRunner:
                         "retrieval_mode": "standard",
                         "resolved_top_k": 5,
                         "trace": result.payload.get("trace", []),
+                        "trace_log_path": result.payload.get("traceLogPath"),
                     },
                     "metrics": {"Recall": 0.0},
                     "token_usage": {
@@ -627,8 +702,10 @@ class BenchmarkRunner:
                 }
             )
             self._write_generated_answers(experiment, records)
+            group_manifest["completed_answers"] = len(records)
+            self._write_group_manifest(corpus_id, group_manifest)
         self._write_report(experiment, records, ingestion, deletion=None)
-        return records
+        return records, run_id
 
     def _load_existing_records(
         self, experiment: PreparedExperiment
@@ -1032,6 +1109,12 @@ def _is_incomplete_ingest_telemetry(error: BridgeRequestError) -> bool:
     return (
         error.detail
         == "Provider usage telemetry was incomplete during ingestion"
+    )
+
+
+def _is_retryable_qa_error(error: BridgeRequestError) -> bool:
+    return error.retryable_transport_failure or (
+        error.detail == "Provider usage telemetry was incomplete during QA"
     )
 
 

@@ -33,6 +33,9 @@ git apply /path/to/patches/llm_wiki/0007-reactivate-empty-project-after-delete.p
 
 git apply --check /path/to/patches/llm_wiki/0008-searchable-only-deletion-telemetry.patch
 git apply /path/to/patches/llm_wiki/0008-searchable-only-deletion-telemetry.patch
+
+git apply --check /path/to/patches/llm_wiki/0009-benchmark-qa-json-trace.patch
+git apply /path/to/patches/llm_wiki/0009-benchmark-qa-json-trace.patch
 ```
 
 `0001` makes the approved model settings enforceable on both the TypeScript ingest
@@ -88,8 +91,12 @@ WebKit file-watch events can subsequently clear the in-memory active project.
 search data, and LanceDB vectors. Frontend quiescence plus non-searchable cleanup
 and project recovery are reported separately for audit.
 
+`0009` requests strict JSON objects for benchmark Agent decisions and writes each
+QA Agent event to a flushed JSONL trace as it happens. Generation start/end events
+make a slow or interrupted question diagnosable before the HTTP response finishes.
+
 The benchmark runner does not accept the stock LLM Wiki API as a benchmark bridge.
 Stock `AgentUsage` reports character counts, not provider tokens, and the stock API
 does not expose an atomic ingest-plus-review-sweep operation. Apply the patches to
 obtain the bridge specified in [`bridge_contract.md`](bridge_contract.md); the runner
-never substitutes character estimates. Apply all eight patches in order.
+never substitutes character estimates. Apply all nine patches in order.

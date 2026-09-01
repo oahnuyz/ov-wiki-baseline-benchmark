@@ -40,6 +40,8 @@ execution:
   service_stop_command:
     - "/home/ZhangYunhao/nashsu-llm-wiki-baseline/tools/stop-llm-wiki-headless.sh"
   startup_timeout_seconds: 300
+  qa_timeout_seconds: 600
+  max_qa_retries: 2
   request_timeout_seconds: 129600
 
 paths:

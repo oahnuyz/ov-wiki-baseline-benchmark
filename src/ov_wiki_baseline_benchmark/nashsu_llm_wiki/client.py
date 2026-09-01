@@ -172,6 +172,7 @@ class LlmWikiBridgeClient:
                 "skillMode": "explicit",
                 "persistSession": False,
             },
+            timeout_seconds=self.config.qa_timeout_seconds,
         )
         return QaResult.from_wire(value)
 
@@ -182,14 +183,21 @@ class LlmWikiBridgeClient:
             raise RuntimeError("Deletion unexpectedly consumed model or embedding tokens")
         return stage
 
-    def _request(self, method: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any],
+        *,
+        timeout_seconds: int | None = None,
+    ) -> dict[str, Any]:
         try:
             response = requests.request(
                 method,
                 f"{self.base_url}{path}",
                 headers=self.headers,
                 json=body,
-                timeout=self.config.request_timeout_seconds,
+                timeout=timeout_seconds or self.config.request_timeout_seconds,
             )
         except requests.RequestException as exc:
             raise BridgeRequestError(status_code=None, detail=str(exc)) from exc

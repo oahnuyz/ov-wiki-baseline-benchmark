@@ -28,6 +28,8 @@ class BenchmarkConfig:
     project_path: Path
     startup_timeout_seconds: int
     request_timeout_seconds: int
+    qa_timeout_seconds: int = 600
+    max_qa_retries: int = 2
     ingest_batch_size: int = 25
     max_batch_retries: int = 2
     restart_between_ingest_batches: bool = True
@@ -78,6 +80,8 @@ class BenchmarkConfig:
             project_path=Path(_text(paths, "project_path")).expanduser().resolve(),
             startup_timeout_seconds=_integer(execution, "startup_timeout_seconds"),
             request_timeout_seconds=_integer(execution, "request_timeout_seconds"),
+            qa_timeout_seconds=_optional_integer(execution, "qa_timeout_seconds", 600),
+            max_qa_retries=_optional_integer(execution, "max_qa_retries", 2),
             ingest_batch_size=_optional_integer(execution, "ingest_batch_size", 25),
             max_batch_retries=_optional_integer(execution, "max_batch_retries", 2),
             restart_between_ingest_batches=_optional_boolean(
@@ -119,6 +123,10 @@ class BenchmarkConfig:
             raise ValueError("Invalid fixed benchmark config: " + "; ".join(mismatches))
         if self.startup_timeout_seconds <= 0 or self.request_timeout_seconds <= 0:
             raise ValueError("startup and request timeouts must be positive")
+        if self.qa_timeout_seconds <= 0:
+            raise ValueError("qa_timeout_seconds must be positive")
+        if self.max_qa_retries < 0:
+            raise ValueError("max_qa_retries must be non-negative")
         if self.ingest_batch_size <= 0:
             raise ValueError("ingest_batch_size must be positive")
         if self.max_batch_retries < 0:
@@ -164,6 +172,8 @@ class BenchmarkConfig:
                 "ingestBatchSize": self.ingest_batch_size,
                 "maxBatchRetries": self.max_batch_retries,
                 "restartBetweenIngestBatches": self.restart_between_ingest_batches,
+                "qaTimeoutSeconds": self.qa_timeout_seconds,
+                "maxQaRetries": self.max_qa_retries,
             },
             "model": {
                 "name": self.model,
