@@ -488,7 +488,7 @@ Agent 先构造项目上下文和工具说明，然后由同一主 LLM 在最多
 Web、AnyTXT 和 skills 不可用，写 Wiki 也不是本轮授权行为。本实验 Standard retrieval budget 为 15；
 达到预算后系统强制进入 final-only prompt。
 
-“最多 8 次循环”统计所有模型决策，不只是检索。一次循环只能选择一个工具动作或 final。
+“最多 20 次循环”统计所有模型决策，不只是检索。一次循环只能选择一个工具动作或 final。
 例如 `wiki.search → wiki.read_page → final` 是 3 轮、2 个检索动作。检索预算统计
 `wiki.search`、`wiki.read_page`、`source.search`、`graph.search`、`web.search` 和
 `anytxt.search`；`top_k=5` 只表示一次 `wiki.search` 最多返回 5 个结果，不表示最多搜索
@@ -649,11 +649,11 @@ Judge 的 provider token 单独写入 `judge_telemetry.json`。它不计入“�
 主指标计时内容只有：
 
 - `wiki/` 中除 `wiki/media/` 外的页面，也同时消除由页面关系产生的图候选；
-- 可被 `source.search` 访问的非隐藏 `raw/sources/` 数据；
+- 可被 `source.search` 访问的 `raw/sources/` 数据，包括本次 benchmark 自有的隐藏 staging；
 - `.llm-wiki/lancedb/` 中的页面和分块向量。
 
 queue/review/lint 的前端停写与清空在计时前完成。`wiki/media`、根 `media/`、`raw/parsed/`、
-隐藏 `.benchmark-*` staging、caption/ingest/review/lint 等缓存和其余 `.llm-wiki` 元数据在
+其他不可检索隐藏数据、caption/ingest/review/lint 等缓存和其余 `.llm-wiki` 元数据在
 计时后清理。这些内容仍会被彻底删除，只是不属于可检索数据删除主指标。
 
 系统在删除前验证项目 ID 没有变化、项目路径为绝对安全路径，并且只操作 run 注册的专用
@@ -765,7 +765,7 @@ Total Deletion Token Cost = 0
 ```
 
 报告另列 `Frontend Quiescence Time` 与 `Post-Deletion Cleanup and Recovery Time`。前者覆盖
-queue/review/lint 停写清理，后者覆盖 media、parsed、隐藏 staging、缓存/元数据、项目恢复和
+queue/review/lint 停写清理，后者覆盖 media、parsed、不可检索隐藏数据、缓存/元数据、项目恢复和
 run registry 清理；两者都不进入 `Total Deletion Time`。必要的 WebKit 服务重启也在主指标外。
 
 批次快照位于项目外，且通常在每批最终成功后立即删除；异常退出遗留的快照会在下次运行
