@@ -12,11 +12,13 @@ dependencies = [
     "PyYAML>=6.0,<7",
     "requests>=2.31,<3",
     "tqdm>=4.66,<5",
+    "pdfplumber>=0.11,<1",
 ]
 
 [project.scripts]
 ov-wiki-data = "ov_wiki_baseline_benchmark.cli:main"
 ov-wiki-nashsu = "ov_wiki_baseline_benchmark.nashsu_llm_wiki.cli:main"
+ov-wiki-tencentdb = "ov_wiki_baseline_benchmark.tencentdb.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
