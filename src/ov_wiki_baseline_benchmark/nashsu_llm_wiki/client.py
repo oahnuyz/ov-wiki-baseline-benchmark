@@ -165,6 +165,8 @@ class LlmWikiBridgeClient:
                 "sessionId": session_id,
                 "mode": "standard",
                 "retrievalMode": "standard",
+                "maxAgentIterations": self.config.qa_max_agent_iterations,
+                "maxRetrievalActions": self.config.qa_max_retrieval_actions,
                 "tools": {"wiki": True, "web": False, "anytxt": False},
                 "history": [],
                 "historyExplicit": True,

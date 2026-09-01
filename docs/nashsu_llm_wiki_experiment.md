@@ -195,11 +195,14 @@ runner 将一个实验全部文档的 `sha256` 排序后串联，再计算 corpu
 ### 5.2 Agent mode 与 retrieval mode 是两个独立参数
 
 `mode` 控制 Agent loop 的总决策预算；`retrievalMode` 控制检索策略。此前用户所说的
-“使用 standard”在本实验中明确落实为两个相互独立且都采用官方默认值的选择：
+“使用 standard”在本实验中明确落实为两个相互独立的选择；检索算法仍为 Standard，
+但从本次重跑起只在 benchmark bridge 中扩大循环预算：
 
 ```text
 mode = standard
 retrievalMode = standard
+maxAgentIterations = 20
+maxRetrievalActions = 15
 ```
 
 Agent mode 的可选值为：
@@ -207,7 +210,7 @@ Agent mode 的可选值为：
 | Agent mode | 无 skills 时的最多 Agent 轮次 | `retrievalMode=standard` 时的最多检索动作 | 主要区别 |
 |---|---:|---:|---|
 | `fast` | 4 | 2 | 较小的工具与回答预算 |
-| `standard` | 8 | 4 | 官方默认 Agent loop |
+| `standard` | 8（本实验覆盖为 20） | 4（本实验覆盖为 15） | 官方 Standard 算法；仅 benchmark 扩大预算 |
 | `deep` | 12 | 8 | 更大预算，并更积极纳入原始来源或已开启的外部工具 |
 | `local_first` | 8 | 4 | 固定版本中预算与 Standard 相同；当前源码未显示另一套实质性检索算法 |
 
@@ -215,7 +218,7 @@ Retrieval mode 的可选值为：
 
 | Retrieval mode | `mode=standard` 时的最多检索动作 | 行为 |
 |---|---:|---|
-| `standard` | 4 | 模型在预算内自行决定搜什么、读什么和何时回答 |
+| `standard` | 4（本实验覆盖为 15） | 模型在预算内自行决定搜什么、读什么和何时回答 |
 | `smart` | 4 | 每次观察后识别尚缺证据，修改查询，抑制近似重复；连续两次没有新增证据时强制结束检索 |
 | `faithful` | 3 | 只以 raw source excerpt 或显式附件为证据，排除生成 Wiki、overview/schema、Web 和 AnyTXT |
 
@@ -226,10 +229,11 @@ Retrieval mode 的可选值为：
 ### 5.3 Nashsu Standard Agent loop 的具体含义
 
 在固定版本中，只要后端 LLM 可用，Standard 模式进入 **模型驱动的 Agent loop**，而不是
-固定执行一次检索再回答：
+固定执行一次检索再回答。官方默认是 8 轮 / 4 次检索；本实验重跑的 benchmark-only
+覆盖值为：
 
-- 最多 8 次 Agent 迭代；
-- `retrieval_mode=standard` 且没有 skills 时，最多 4 个检索工具动作；
+- 最多 20 次 Agent 迭代；
+- `retrieval_mode=standard` 且没有 skills 时，最多 15 个检索工具动作；
 - 每一轮 LLM 输出紧凑 JSON，选择一个工具动作或直接输出 final answer；
 - 可用的内部检索工具主要是 `wiki.search` 与 `wiki.read_page`；
 - 工具结果作为 observation 回到下一轮；
@@ -465,19 +469,23 @@ Question: {question}
 - `tools={wiki: true, web: false, anytxt: false}`
 - `mode=standard`
 - `retrievalMode=standard`
+- `maxAgentIterations=20`
+- `maxRetrievalActions=15`
 - 不发送 `topK`
 
 因此不会读取上一题对话，也不会把本题写入持久化聊天历史。所有题串行运行。
 
 ### 8.2 Standard Agent 如何决定检索
 
-Agent 先构造项目上下文和工具说明，然后由同一主 LLM 在最多 8 次循环内选择动作：
+Agent 先构造项目上下文和工具说明，然后由同一主 LLM 在最多 20 次循环内选择动作：
 
 - `wiki.search(query, topK=5)`：对生成 Wiki 做混合检索；
 - `wiki.read_page(path)`：读取已找到的完整 Wiki 页面；
+- `source.search(query, topK≤10)`：关键词扫描当前 corpus 的原始 source excerpt；
+- `graph.search(query)`：由 Wiki frontmatter 与 wikilink 构图后检索直接关系；
 - `final(answer)`：结束并回答。
 
-Web、AnyTXT 和 skills 不可用，写 Wiki 也不是本轮授权行为。Standard retrieval budget 为 4；
+Web、AnyTXT 和 skills 不可用，写 Wiki 也不是本轮授权行为。本实验 Standard retrieval budget 为 15；
 达到预算后系统强制进入 final-only prompt。
 
 “最多 8 次循环”统计所有模型决策，不只是检索。一次循环只能选择一个工具动作或 final。
@@ -812,14 +820,17 @@ run registry 清理；两者都不进入 `Total Deletion Time`。必要的 WebKi
 ## 14. 部署验证状态与结果解释限制
 
 模式与输入原则已经确定：官方 General 模板不做人工编辑、`mode=standard`、
-`retrievalMode=standard`，并且不增加 QA 动作硬限制。正式 PaperScope 实验启动前已完成：
+`retrievalMode=standard`。旧轮次使用官方 8/4 预算；本次重跑使用 benchmark-only 的
+20 轮 Agent 决策和最多 15 次检索。正式 PaperScope 重跑前需完成：
 
 1. **服务器完整编译验证**：七个补丁可顺序应用；TypeScript typecheck、相关 Vitest、Rust
    定向测试、Python 20 项单元测试和带 `tauri/custom-protocol` 的 Linux release 构建通过。
 2. **重启续批 smoke test**：Xvfb/WebKit readiness、完整进程组重启、重启后
    `continuation=true` 的受保护脚手架校验均通过，未调用模型。
-3. **Agent trace 审计**：不增加动作 allowlist，也不强制至少一次检索。正式 QA 的逐题输出
-   会记录工具序列；直接 final 或理论上的非检索动作保留为 Nashsu 官方行为，通过 trace 审计。
+3. **Agent trace 审计**：不强制每题调用固定检索工具，也不修改官方 Agent prompt。
+   正式 QA 的逐题输出会记录工具序列；raw source 只放开当前 benchmark 自有的
+   `raw/sources/.benchmark-<run-id>/`，其他隐藏路径仍不可见。可检索不代表 Agent 必然选择
+   `source.search`，其次数允许为 0。
 4. **Recall 指标**：当前 Recall 为占位 0。若要比较检索质量，应定义基于 gold document IDs
    或 evidence 的 Recall@K，并确保 Nashsu trace 可以映射回标准文档。
 5. **Doubao 1024 维 smoke test**：真实 API 1024 维探针通过；临时 Wiki 页面写入返回

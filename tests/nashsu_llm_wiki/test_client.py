@@ -19,6 +19,8 @@ class ClientReadinessTests(unittest.TestCase):
             startup_timeout_seconds=2,
             request_timeout_seconds=30,
             qa_timeout_seconds=7,
+            qa_max_agent_iterations=20,
+            qa_max_retrieval_actions=15,
             service_restart_command=("restart-service",),
             service_stop_command=("stop-service",),
             bridge_token=lambda: "bridge-token",
@@ -144,6 +146,8 @@ class ClientReadinessTests(unittest.TestCase):
         with patch.object(client, "_request", return_value=response) as request:
             client.answer("run-1", prompt="Question", session_id="session-1")
         self.assertEqual(request.call_args.kwargs["timeout_seconds"], 7)
+        self.assertEqual(request.call_args.args[2]["maxAgentIterations"], 20)
+        self.assertEqual(request.call_args.args[2]["maxRetrievalActions"], 15)
 
 
 if __name__ == "__main__":

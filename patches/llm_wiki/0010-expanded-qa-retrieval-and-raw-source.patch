@@ -1,0 +1,286 @@
+--- a/src-tauri/src/benchmark.rs
++++ b/src-tauri/src/benchmark.rs
+@@ -13,6 +13,9 @@
+ const ARK_API_KEY_ENV: &str = "ARK_API_KEY";
+ const BRIDGE_TOKEN_ENV: &str = "LLM_WIKI_API_TOKEN";
+ 
++pub const QA_MAX_AGENT_ITERATIONS: usize = 20;
++pub const QA_MAX_RETRIEVAL_ACTIONS: usize = 15;
++
+ #[derive(Debug, Clone, Serialize)]
+ #[serde(rename_all = "camelCase")]
+ pub struct BootstrapConfig {
+--- a/src-tauri/src/agent/runtime.rs
++++ b/src-tauri/src/agent/runtime.rs
+@@ -2829,6 +2829,17 @@
+ }
+ 
+ fn agent_loop_iteration_budget(mode: AgentMode, has_skills: bool) -> usize {
++    agent_loop_iteration_budget_for(mode, has_skills, crate::benchmark::is_active())
++}
++
++fn agent_loop_iteration_budget_for(
++    mode: AgentMode,
++    has_skills: bool,
++    benchmark_active: bool,
++) -> usize {
++    if benchmark_active && mode == AgentMode::Standard && !has_skills {
++        return crate::benchmark::QA_MAX_AGENT_ITERATIONS;
++    }
+     let base = match mode {
+         AgentMode::Fast => 4,
+         AgentMode::Standard | AgentMode::LocalFirst => MAX_AGENT_TOOL_ITERATIONS,
+@@ -2849,6 +2860,27 @@
+     retrieval_mode: AgentRetrievalMode,
+     has_explicit_skills: bool,
+ ) -> usize {
++    agent_loop_retrieval_budget_for(
++        mode,
++        retrieval_mode,
++        has_explicit_skills,
++        crate::benchmark::is_active(),
++    )
++}
++
++fn agent_loop_retrieval_budget_for(
++    mode: AgentMode,
++    retrieval_mode: AgentRetrievalMode,
++    has_explicit_skills: bool,
++    benchmark_active: bool,
++) -> usize {
++    if benchmark_active
++        && mode == AgentMode::Standard
++        && retrieval_mode == AgentRetrievalMode::Standard
++        && !has_explicit_skills
++    {
++        return crate::benchmark::QA_MAX_RETRIEVAL_ACTIONS;
++    }
+     if retrieval_mode == AgentRetrievalMode::Faithful {
+         return match mode {
+             AgentMode::Fast => 2,
+@@ -4745,6 +4777,36 @@
+     }
+ 
+     #[test]
++    fn benchmark_standard_qa_uses_expanded_agent_and_retrieval_budgets() {
++        assert_eq!(
++            agent_loop_iteration_budget_for(AgentMode::Standard, false, true),
++            crate::benchmark::QA_MAX_AGENT_ITERATIONS
++        );
++        assert_eq!(
++            agent_loop_retrieval_budget_for(
++                AgentMode::Standard,
++                AgentRetrievalMode::Standard,
++                false,
++                true,
++            ),
++            crate::benchmark::QA_MAX_RETRIEVAL_ACTIONS
++        );
++        assert_eq!(
++            agent_loop_iteration_budget_for(AgentMode::Standard, false, false),
++            8
++        );
++        assert_eq!(
++            agent_loop_retrieval_budget_for(
++                AgentMode::Standard,
++                AgentRetrievalMode::Standard,
++                false,
++                false,
++            ),
++            4
++        );
++    }
++
++    #[test]
+     fn smart_retrieval_normalizes_equivalent_query_signatures() {
+         let left = serde_json::json!({"query": "Agent,   Runtime!", "topK": 5});
+         let right = serde_json::json!({"query": "agent runtime", "topK": 5});
+--- a/src-tauri/src/agent/tools.rs
++++ b/src-tauri/src/agent/tools.rs
+@@ -2395,6 +2395,20 @@
+     query: &str,
+     top_k: usize,
+ ) -> Result<Vec<AgentReference>, String> {
++    search_sources_with_benchmark_state(
++        project_path,
++        query,
++        top_k,
++        crate::benchmark::is_active(),
++    )
++}
++
++fn search_sources_with_benchmark_state(
++    project_path: &str,
++    query: &str,
++    top_k: usize,
++    benchmark_active: bool,
++) -> Result<Vec<AgentReference>, String> {
+     let query = query.trim();
+     if query.is_empty() {
+         return Err("source.search query is required".to_string());
+@@ -2412,7 +2426,7 @@
+             continue;
+         }
+         let rel = relative_to_project(project_path, entry.path());
+-        if is_hidden_rel(&rel) {
++        if !is_searchable_source_rel(&rel, benchmark_active) {
+             continue;
+         }
+         seen_files += 1;
+@@ -2594,6 +2608,25 @@
+     normalize_rel_path(rel)
+         .split('/')
+         .any(|segment| segment.starts_with('.'))
++}
++
++fn is_searchable_source_rel(rel: &str, benchmark_active: bool) -> bool {
++    if !is_hidden_rel(rel) {
++        return true;
++    }
++    if !benchmark_active {
++        return false;
++    }
++    let normalized = normalize_rel_path(rel);
++    let segments = normalized.split('/').collect::<Vec<_>>();
++    segments.len() >= 4
++        && segments[0].eq_ignore_ascii_case("raw")
++        && segments[1].eq_ignore_ascii_case("sources")
++        && segments[2].starts_with(".benchmark-")
++        && segments[2].len() > ".benchmark-".len()
++        && segments[3..]
++            .iter()
++            .all(|segment| !segment.is_empty() && !segment.starts_with('.'))
+ }
+ 
+ fn normalize_rel_path(path: &str) -> String {
+@@ -3416,6 +3449,63 @@
+         let refs = search_sources(root.to_str().unwrap(), "原始资料 煤矿安全", 5).unwrap();
+         assert_eq!(refs.len(), 1);
+         assert_eq!(refs[0].kind, "source");
++        let _ = fs::remove_dir_all(root);
++    }
++
++    #[test]
++    fn benchmark_source_search_allows_only_owned_hidden_staging() {
++        assert!(!is_searchable_source_rel(
++            "raw/sources/.benchmark-run/document.pdf",
++            false,
++        ));
++        assert!(is_searchable_source_rel(
++            "raw/sources/.benchmark-run/document.pdf",
++            true,
++        ));
++        assert!(!is_searchable_source_rel(
++            "raw/sources/.private/document.pdf",
++            true,
++        ));
++        assert!(!is_searchable_source_rel(
++            "raw/sources/.benchmark-run/.secret.pdf",
++            true,
++        ));
++        assert!(is_searchable_source_rel(
++            "raw/sources/public/document.pdf",
++            false,
++        ));
++
++        let root = std::env::temp_dir().join(format!(
++            "llm-wiki-benchmark-source-search-{}",
++            Uuid::new_v4()
++        ));
++        let staging = root
++            .join("raw")
++            .join("sources")
++            .join(".benchmark-run");
++        fs::create_dir_all(&staging).expect("create benchmark staging");
++        fs::write(
++            staging.join("probe.txt"),
++            "The benchmark retrieval probe phrase is cobalt-orchid-719.",
++        )
++        .expect("write benchmark probe");
++        assert!(search_sources_with_benchmark_state(
++            root.to_str().expect("temp path"),
++            "cobalt orchid 719",
++            5,
++            false,
++        )
++        .expect("non-benchmark source search")
++        .is_empty());
++        let matches = search_sources_with_benchmark_state(
++            root.to_str().expect("temp path"),
++            "cobalt orchid 719",
++            5,
++            true,
++        )
++        .expect("benchmark source search");
++        assert_eq!(matches.len(), 1);
++        assert!(matches[0].path.contains(".benchmark-run/probe.txt"));
+         let _ = fs::remove_dir_all(root);
+     }
+ 
+--- a/src-tauri/src/api_server.rs
++++ b/src-tauri/src/api_server.rs
+@@ -2253,6 +2253,10 @@
+         || value.get("sessionId").and_then(Value::as_str).is_none()
+         || value.get("mode").and_then(Value::as_str) != Some("standard")
+         || value.get("retrievalMode").and_then(Value::as_str) != Some("standard")
++        || value.get("maxAgentIterations").and_then(Value::as_u64)
++            != Some(benchmark::QA_MAX_AGENT_ITERATIONS as u64)
++        || value.get("maxRetrievalActions").and_then(Value::as_u64)
++            != Some(benchmark::QA_MAX_RETRIEVAL_ACTIONS as u64)
+         || value.get("topK").is_some()
+         || !valid_tools
+         || !empty_history
+@@ -2482,7 +2486,8 @@
+     let frontend_cleanup_duration_seconds = frontend_cleanup_started.elapsed().as_secs_f64();
+ 
+     // The primary deletion metric covers only data that can contribute to QA
+-    // retrieval: Wiki keyword/graph pages, non-hidden raw source-search files,
++    // retrieval: Wiki keyword/graph pages, raw source-search files (including
++    // benchmark-owned hidden staging),
+     // and LanceDB vectors. Runtime state, caches, media, staging, and project
+     // recovery are deliberately outside this interval.
+     let searchable_started = Instant::now();
+@@ -2491,7 +2496,9 @@
+         return err(500, error);
+     }
+     let raw_sources = project_root.join("raw").join("sources");
+-    if let Err(error) = remove_benchmark_children(&raw_sources, |name| !name.starts_with('.')) {
++    if let Err(error) = remove_benchmark_children(&raw_sources, |name| {
++        !name.starts_with('.') || name.starts_with(".benchmark-")
++    }) {
+         return err(500, error);
+     }
+     let lancedb = project_root.join(".llm-wiki").join("lancedb");
+@@ -2506,14 +2513,6 @@
+             return err(500, error);
+         }
+     }
+-    // A restart-safe batched run can use more than one in-memory benchmark
+-    // run id. Remove every benchmark-owned staging directory from this
+-    // dedicated project rather than leaking earlier batches under raw/sources.
+-    if let Err(error) =
+-        remove_benchmark_children(&raw_sources, |name| name.starts_with(".benchmark-"))
+-    {
+-        return err(500, error);
+-    }
+     let metadata = project_root.join(".llm-wiki");
+     if let Err(error) = remove_benchmark_path(&metadata) {
+         return err(500, error);
+@@ -2549,7 +2548,7 @@
+         "onlySearchableDataIncludedInPrimaryTime": true,
+         "timedDeletionScope": [
+             "wiki-pages-and-derived-graph-data",
+-            "non-hidden-raw-source-search-data",
++            "raw-source-search-data-including-benchmark-staging",
+             "lancedb-page-and-chunk-vectors",
+         ],
+         "usage": { "inputTokens": 0, "outputTokens": 0, "embeddingTokens": 0 },
+@@ -3754,6 +3757,8 @@
+             "sessionId": "unique",
+             "mode": "standard",
+             "retrievalMode": "standard",
++            "maxAgentIterations": benchmark::QA_MAX_AGENT_ITERATIONS,
++            "maxRetrievalActions": benchmark::QA_MAX_RETRIEVAL_ACTIONS,
+             "tools": { "wiki": true, "web": false, "anytxt": false },
+             "history": [],
+             "historyExplicit": true,

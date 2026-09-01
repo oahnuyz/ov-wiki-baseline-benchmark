@@ -1,7 +1,9 @@
 # Nashsu LLM Wiki benchmark bridge contract
 
 This is the boundary between the Python benchmark runner and the pinned LLM Wiki
-fork. It is benchmark-only control and telemetry: it must not change retrieval,
+fork. It is benchmark-only control and telemetry. The benchmark QA route also
+applies the explicitly recorded 20-iteration / 15-retrieval budget and exposes
+only benchmark-owned raw staging to `source.search`; it must not otherwise change retrieval,
 ranking, prompt content, Wiki generation, review resolution, or answer generation.
 
 All routes are under `/api/v1/benchmark`, bind to loopback only, and require the
@@ -183,7 +185,11 @@ restart time is recorded separately as operational wall-clock overhead.
 
 Accepts the stock Agent request fields plus the fully rendered approved prompt.
 The benchmark endpoint measures from Agent invocation through final answer and
-usage collection. It must not hydrate persisted history.
+usage collection. It must not hydrate persisted history. It requires
+`maxAgentIterations=20` and `maxRetrievalActions=15`; these values are recorded in
+the public manifest. The runtime applies them only to benchmark-active Standard
+QA without skills. `source.search` may read the active corpus under
+`raw/sources/.benchmark-<run-id>/`, while every other hidden raw path stays excluded.
 
 Response:
 
@@ -208,9 +214,9 @@ Response:
 
 Deletes all data created for the current corpus. The primary timer covers only
 retrieval-visible state: generated Wiki pages and their derived graph candidates,
-non-hidden raw sources addressable by `source.search`, and LanceDB page/chunk
+raw sources addressable by `source.search` (including benchmark-owned staging), and LanceDB page/chunk
 vectors. Frontend queue/review/lint quiescence happens before the timer. Media,
-hidden staging, parsed/caption/ingest/review/lint caches, remaining metadata,
+non-searchable hidden data, parsed/caption/ingest/review/lint caches, remaining metadata,
 project reactivation, run-registry cleanup, and service recovery happen after it.
 Those two excluded phases are reported separately. The endpoint must reject any
 target outside the run's exact dedicated project path.
@@ -227,7 +233,7 @@ Response:
   "onlySearchableDataIncludedInPrimaryTime": true,
   "timedDeletionScope": [
     "wiki-pages-and-derived-graph-data",
-    "non-hidden-raw-source-search-data",
+    "raw-source-search-data-including-benchmark-staging",
     "lancedb-page-and-chunk-vectors"
   ],
   "usage": {

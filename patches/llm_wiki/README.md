@@ -36,6 +36,9 @@ git apply /path/to/patches/llm_wiki/0008-searchable-only-deletion-telemetry.patc
 
 git apply --check /path/to/patches/llm_wiki/0009-benchmark-qa-json-trace.patch
 git apply /path/to/patches/llm_wiki/0009-benchmark-qa-json-trace.patch
+
+git apply --check /path/to/patches/llm_wiki/0010-expanded-qa-retrieval-and-raw-source.patch
+git apply /path/to/patches/llm_wiki/0010-expanded-qa-retrieval-and-raw-source.patch
 ```
 
 `0001` makes the approved model settings enforceable on both the TypeScript ingest
@@ -95,8 +98,13 @@ and project recovery are reported separately for audit.
 QA Agent event to a flushed JSONL trace as it happens. Generation start/end events
 make a slow or interrupted question diagnosable before the HTTP response finishes.
 
+`0010` expands benchmark Standard QA to 20 Agent decisions and at most 15 retrieval
+actions, makes only the active benchmark-owned hidden raw staging searchable by
+`source.search`, and includes that now-searchable staging in primary deletion
+timing. It does not alter the official Standard Agent prompt or force any tool.
+
 The benchmark runner does not accept the stock LLM Wiki API as a benchmark bridge.
 Stock `AgentUsage` reports character counts, not provider tokens, and the stock API
 does not expose an atomic ingest-plus-review-sweep operation. Apply the patches to
 obtain the bridge specified in [`bridge_contract.md`](bridge_contract.md); the runner
-never substitutes character estimates. Apply all nine patches in order.
+never substitutes character estimates. Apply all ten patches in order.

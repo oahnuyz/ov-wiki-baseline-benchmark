@@ -29,6 +29,8 @@ class BenchmarkConfig:
     startup_timeout_seconds: int
     request_timeout_seconds: int
     qa_timeout_seconds: int = 600
+    qa_max_agent_iterations: int = 20
+    qa_max_retrieval_actions: int = 15
     max_qa_retries: int = 2
     ingest_batch_size: int = 25
     max_batch_retries: int = 2
@@ -81,6 +83,12 @@ class BenchmarkConfig:
             startup_timeout_seconds=_integer(execution, "startup_timeout_seconds"),
             request_timeout_seconds=_integer(execution, "request_timeout_seconds"),
             qa_timeout_seconds=_optional_integer(execution, "qa_timeout_seconds", 600),
+            qa_max_agent_iterations=_optional_integer(
+                execution, "qa_max_agent_iterations", 20
+            ),
+            qa_max_retrieval_actions=_optional_integer(
+                execution, "qa_max_retrieval_actions", 15
+            ),
             max_qa_retries=_optional_integer(execution, "max_qa_retries", 2),
             ingest_batch_size=_optional_integer(execution, "ingest_batch_size", 25),
             max_batch_retries=_optional_integer(execution, "max_batch_retries", 2),
@@ -125,6 +133,10 @@ class BenchmarkConfig:
             raise ValueError("startup and request timeouts must be positive")
         if self.qa_timeout_seconds <= 0:
             raise ValueError("qa_timeout_seconds must be positive")
+        if self.qa_max_agent_iterations != 20:
+            raise ValueError("qa_max_agent_iterations must be 20 for this benchmark")
+        if self.qa_max_retrieval_actions != 15:
+            raise ValueError("qa_max_retrieval_actions must be 15 for this benchmark")
         if self.max_qa_retries < 0:
             raise ValueError("max_qa_retries must be non-negative")
         if self.ingest_batch_size <= 0:
@@ -173,6 +185,9 @@ class BenchmarkConfig:
                 "maxBatchRetries": self.max_batch_retries,
                 "restartBetweenIngestBatches": self.restart_between_ingest_batches,
                 "qaTimeoutSeconds": self.qa_timeout_seconds,
+                "qaMaxAgentIterations": self.qa_max_agent_iterations,
+                "qaMaxRetrievalActions": self.qa_max_retrieval_actions,
+                "benchmarkRawSourceSearch": True,
                 "maxQaRetries": self.max_qa_retries,
             },
             "model": {

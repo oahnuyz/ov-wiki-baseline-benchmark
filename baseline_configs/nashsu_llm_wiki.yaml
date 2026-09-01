@@ -41,6 +41,8 @@ execution:
     - "/home/ZhangYunhao/nashsu-llm-wiki-baseline/tools/stop-llm-wiki-headless.sh"
   startup_timeout_seconds: 300
   qa_timeout_seconds: 600
+  qa_max_agent_iterations: 20
+  qa_max_retrieval_actions: 15
   max_qa_retries: 2
   request_timeout_seconds: 129600
 
