@@ -148,6 +148,31 @@ class FakeJudge:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_skip_deletion_preserves_project_and_marks_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            experiment = _prepared_experiment(root)
+            (root / "project").mkdir()
+            bridge = FakeBridge()
+            runner = BenchmarkRunner(
+                _config(root),
+                answer_prompt_path=repository_root()
+                / "prompts"
+                / "ov_wiki_bot_answer.txt",
+                judge_prompt_path=repository_root()
+                / "prompts"
+                / "generic_llm_judge_user.txt",
+                bridge=bridge,
+                judge=FakeJudge(),
+            )
+
+            manifest = runner.run_group([experiment], skip_deletion=True)
+
+            self.assertFalse(bridge.deleted)
+            self.assertEqual(manifest["status"], "completed_without_deletion")
+            self.assertTrue(manifest["deletion_skipped"])
+            self.assertEqual(manifest["preserved_project_path"], str(root / "project"))
+
     def test_retryable_qa_failure_restarts_and_excludes_failed_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)

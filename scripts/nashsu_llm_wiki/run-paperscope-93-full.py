@@ -23,7 +23,7 @@ EXPERIMENT_IDS = [
 DATA_ROOT = Path("/noraiddata/ZhangYunhao/ov-wiki-benchmark-data")
 OUTPUT_ROOT = Path.home() / (
     "nashsu-llm-wiki-baseline/results/"
-    "paperscope_93_rerun_20260901_v3_15_retrievals"
+    "paperscope_93_rerun_20260901_v4_15_retrievals_no_delete"
 )
 
 
@@ -73,7 +73,11 @@ def main() -> int:
         judge_prompt_path=root / "prompts" / "generic_llm_judge_user.txt",
     )
     try:
-        result = runner.run_group(groups[0], resume_ingest=False)
+        result = runner.run_group(
+            groups[0],
+            resume_ingest=False,
+            skip_deletion=True,
+        )
         write_json(
             OUTPUT_ROOT / "PIPELINE_COMPLETE.json",
             {
@@ -83,7 +87,8 @@ def main() -> int:
                 "question_count": total_questions,
                 "final_manifest_status": result.get("status"),
                 "ingestion": result.get("ingestion"),
-                "deletion": result.get("deletion"),
+                "deletion_skipped": result.get("deletion_skipped"),
+                "preserved_project_path": result.get("preserved_project_path"),
             },
         )
         return 0

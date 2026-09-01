@@ -105,6 +105,7 @@ class BenchmarkRunner:
         experiments: list[PreparedExperiment],
         *,
         resume_ingest: bool = False,
+        skip_deletion: bool = False,
     ) -> dict[str, Any]:
         if not experiments:
             raise ValueError("At least one prepared experiment is required")
@@ -213,6 +214,15 @@ class BenchmarkRunner:
                 self._write_group_manifest(corpus_id, group_manifest)
                 self._run_judge(experiment, records, ingestion)
                 completed.append((experiment, records))
+
+            if skip_deletion:
+                group_manifest["status"] = "completed_without_deletion"
+                group_manifest.pop("resume_from_status", None)
+                group_manifest.pop("active_experiment", None)
+                group_manifest["deletion_skipped"] = True
+                group_manifest["preserved_project_path"] = str(project_path)
+                self._write_group_manifest(corpus_id, group_manifest)
+                return group_manifest
 
             deletion = self.bridge.delete(run_id)
             for experiment, records in completed:
