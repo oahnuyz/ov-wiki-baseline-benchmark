@@ -241,9 +241,18 @@ class TencentDBRunner:
                 if attempt > 1:
                     retry_files = [item for source in sorted(retry_sources) for item in by_source_files[source]]
                     try:
-                        self._service(ledger, "ingest", "wiki.raw.write.retry", client.raw_write, wiki_id,
-                                      [{"filename": x["filename"], "content": x["content"]} for x in retry_files],
-                                      experiment_id=experiment.spec.id, token_bearing=False)
+                        for batch_offset in range(0, len(retry_files), 10):
+                            retry_batch = retry_files[batch_offset : batch_offset + 10]
+                            self._service(
+                                ledger,
+                                "ingest",
+                                "wiki.raw.write.retry",
+                                client.raw_write,
+                                wiki_id,
+                                [{"filename": x["filename"], "content": x["content"]} for x in retry_batch],
+                                experiment_id=experiment.spec.id,
+                                token_bearing=False,
+                            )
                     except Exception as exc:
                         attempts.append({"attempt": attempt, "status": "raw_write_failed", "sources": sorted(retry_sources), "error": str(exc)})
                         continue
