@@ -23,7 +23,7 @@ execution:
   top_k: "official_default"
   max_context_size: "official_default"
   project_template: "general"
-  output_language: "auto"
+  output_language: "English"
   chunking: "official_default"
   persist_extracted_markdown: false
   vector_retrieval: true

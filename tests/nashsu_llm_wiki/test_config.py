@@ -19,7 +19,7 @@ class ConfigTests(unittest.TestCase):
             manifest["llmWiki"]["maxContextSize"]["resolvedValue"], 204800
         )
         self.assertEqual(manifest["llmWiki"]["projectTemplate"], "general")
-        self.assertEqual(manifest["llmWiki"]["outputLanguage"], "auto")
+        self.assertEqual(manifest["llmWiki"]["outputLanguage"], "English")
         self.assertEqual(manifest["llmWiki"]["chunking"], "official_default")
         self.assertIs(manifest["llmWiki"]["persistExtractedMarkdown"], False)
         self.assertEqual(manifest["llmWiki"]["ingestConcurrency"], 1)

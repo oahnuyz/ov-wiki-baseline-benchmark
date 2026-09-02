@@ -85,7 +85,7 @@ class ClientReadinessTests(unittest.TestCase):
             "resolvedMaxContextSize": 204800,
             "projectScaffold": {
                 "template": "general",
-                "outputLanguage": "auto",
+                "outputLanguage": "English",
                 "chunking": "official_default",
                 "persistExtractedMarkdown": False,
                 "continued": True,

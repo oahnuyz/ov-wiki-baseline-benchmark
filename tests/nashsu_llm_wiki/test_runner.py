@@ -61,7 +61,7 @@ class FakeBridge:
             f"run-{len(self.project_paths)}",
             {
                 "template": "general",
-                "outputLanguage": "auto",
+                "outputLanguage": "English",
                 "chunking": "official_default",
                 "persistExtractedMarkdown": False,
                 "fileSha256": {
@@ -294,7 +294,7 @@ class RunnerTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertEqual(group_manifest["project_scaffold"]["template"], "general")
-            self.assertEqual(group_manifest["project_scaffold"]["outputLanguage"], "auto")
+            self.assertEqual(group_manifest["project_scaffold"]["outputLanguage"], "English")
 
     def test_retry_restores_batch_snapshot_and_excludes_failed_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as name:

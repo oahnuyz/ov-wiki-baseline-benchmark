@@ -216,7 +216,7 @@ index 796c75c..d8a7c2e 100644
 +    let scaffold = match frontend.get("projectScaffold") {
 +        Some(value)
 +            if value.get("template").and_then(Value::as_str) == Some("general")
-+                && value.get("outputLanguage").and_then(Value::as_str) == Some("auto")
++                && value.get("outputLanguage").and_then(Value::as_str) == Some("English")
 +                && value.get("chunking").and_then(Value::as_str)
 +                    == Some("official_default")
 +                && value
@@ -1261,7 +1261,7 @@ index 0000000..1a93354
 +    value?.llmWiki?.pdfParser !== "builtin" ||
 +    value?.llmWiki?.reviewSweepIncludedInIngest !== true ||
 +    value?.llmWiki?.projectTemplate !== "general" ||
-+    value?.llmWiki?.outputLanguage !== "auto" ||
++    value?.llmWiki?.outputLanguage !== "English" ||
 +    value?.llmWiki?.chunking !== "official_default" ||
 +    value?.llmWiki?.persistExtractedMarkdown !== false ||
 +    value?.model?.name !== MODEL ||
@@ -1330,7 +1330,7 @@ index 0000000..1a93354
 +  )
 +  return {
 +    template: "general",
-+    outputLanguage: "auto",
++    outputLanguage: "English",
 +    chunking: "official_default",
 +    persistExtractedMarkdown: false,
 +    fileSha256: hashes,
@@ -1432,7 +1432,7 @@ index 0000000..1a93354
 +  state.setMultimodalConfig(multimodal)
 +  state.setMineruConfig(mineru)
 +  state.setSearchApiConfig(search)
-+  state.setOutputLanguage("auto")
++  state.setOutputLanguage("English")
 +  state.setSourceWatchConfig(sourceWatch)
 +  state.setTaskModelRouting(taskRouting)
 +  state.setProjectLlmOverride(projectOverride)
@@ -1443,7 +1443,7 @@ index 0000000..1a93354
 +    saveMultimodalConfig(multimodal),
 +    saveMineruConfig(mineru),
 +    saveSearchApiConfig(search),
-+    saveOutputLanguage("auto", project.id),
++    saveOutputLanguage("English", project.id),
 +    saveSourceWatchConfig(sourceWatch, project.id),
 +    saveTaskModelRouting(taskRouting),
 +    saveProjectLlmOverride(project.id, projectOverride),

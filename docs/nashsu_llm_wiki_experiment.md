@@ -166,7 +166,7 @@ runner 将一个实验全部文档的 `sha256` 排序后串联，再计算 corpu
 | `top_k` | 1–10 | 不传参数，解析为官方默认 `5` | bridge 同时校验返回值为 5 |
 | `maxContextSize` | 用户可配置 | 不覆盖官方默认，要求当前值为 `204800` 字符 | 不等同于 204800 tokens |
 | 项目模板 | Research / Reading / Personal / Business / General | 未经编辑的官方 `General` | 每个 corpus 入库计时前恢复并记录文件 SHA-256 |
-| 输出语言 | `auto` 或固定语言 | 官方 `auto` | 按源内容自动选择页面输出语言 |
+| 输出语言 | `auto` 或固定语言 | 固定 `English` | 所有 Wiki 正文、合并内容与图片 caption 均使用英文，避免 PDF 语言误判 |
 | 主 LLM | 多 provider/model | `doubao-seed-2-0-lite-260428` | provider 记为 Volcengine，LLM Wiki 内部使用 custom OpenAI-compatible wire |
 | temperature | 模型采样参数 | `0` | benchmark telemetry 激活时强制覆盖入库与 QA 调用 |
 | thinking | 开/关/不同预算 | `disabled` | 向 Ark 发送 `thinking: {"type":"disabled"}` |
@@ -842,9 +842,13 @@ run registry 清理；两者都不进入 `Total Deletion Time`。必要的 WebKi
    `vectorsWritten=1`，唯一短语检索返回 `mode=hybrid`、`tokenHits=1`、`vectorHits=1`，
    测试 corpus 随后由正式删除接口清除。
 
-General 脚手架恢复、`outputLanguage=auto`、官方默认 chunk 参数和
+General 脚手架恢复、`outputLanguage=English`、官方默认 chunk 参数和
 `persistExtractedMarkdown=false` 已由 bridge 固定并进入 manifest。Judge usage 缺失按已确认
 策略只记录 `usage_complete=false`，不使实验失败；Judge token 不进入本实验要求的 Accuracy、
 端到端 QA、入库或删除成本指标。
+
+这里不再使用官方 `auto` 语言检测。PaperScope 的英文 PDF 在内置解析后可能含有大量公式、
+希腊字母和提取噪声，`auto` 曾将多数页面误判并强制生成希腊语。固定为 `English` 后，原始
+技术名词和引用可以保留，但周围自然语言必须为英文；该设置同时传入图片 caption 流程。
 
 上述 Recall 限制不影响本实验要求的 Accuracy、端到端回答时间和 token/入库/删除指标。

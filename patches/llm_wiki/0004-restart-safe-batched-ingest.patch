@@ -107,7 +107,7 @@ index 1a93354..e6e182f 100644
 +  )
 +  return {
 +    template: "general",
-+    outputLanguage: "auto",
++    outputLanguage: "English",
 +    chunking: "official_default",
 +    persistExtractedMarkdown: false,
 +    continued: true,

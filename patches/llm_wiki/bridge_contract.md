@@ -49,7 +49,7 @@ and project-open time are outside all measured experiment stages.
 - `maxContextSize` is not overridden; the backend reports the official default
   `204800` characters.
 - The dedicated project is restored before each corpus to the pinned, unedited
-  General template with `outputLanguage=auto`, official default chunking, and
+  General template with `outputLanguage=English`, official default chunking, and
   `persistExtractedMarkdown=false`. The bridge reports SHA-256 for every
   scaffold file and the runner records them in the group manifest.
 - Web search, AnyTXT, and skills are disabled.
@@ -112,7 +112,7 @@ Response:
   "resolvedMaxContextSize": 204800,
   "projectScaffold": {
     "template": "general",
-    "outputLanguage": "auto",
+    "outputLanguage": "English",
     "chunking": "official_default",
     "persistExtractedMarkdown": false,
     "fileSha256": {

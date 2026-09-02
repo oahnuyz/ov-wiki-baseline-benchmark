@@ -57,7 +57,7 @@ class BenchmarkConfig:
         _expect(execution, "top_k", "official_default")
         _expect(execution, "max_context_size", "official_default")
         _expect(execution, "project_template", "general")
-        _expect(execution, "output_language", "auto")
+        _expect(execution, "output_language", "English")
         _expect(execution, "chunking", "official_default")
         _expect(execution, "persist_extracted_markdown", False)
         _expect(execution, "vector_retrieval", True)
@@ -173,7 +173,7 @@ class BenchmarkConfig:
                     "unit": "characters",
                 },
                 "projectTemplate": "general",
-                "outputLanguage": "auto",
+                "outputLanguage": "English",
                 "chunking": "official_default",
                 "persistExtractedMarkdown": False,
                 "vectorRetrieval": True,
