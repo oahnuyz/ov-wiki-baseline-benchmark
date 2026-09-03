@@ -20,7 +20,7 @@ class MetricsAndTelemetryTests(unittest.TestCase):
     def test_create_run_requires_reproducible_general_scaffold_hashes(self) -> None:
         scaffold = {
             "template": "general",
-            "outputLanguage": "auto",
+            "outputLanguage": "English",
             "chunking": "official_default",
             "persistExtractedMarkdown": False,
             "fileSha256": {

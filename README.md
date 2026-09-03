@@ -142,11 +142,14 @@ identical corpus are ingested once, evaluated independently, and deleted once. I
 records provider-reported input/output/embedding tokens and fails closed if any
 measured stage has incomplete telemetry. See
 [`patches/llm_wiki/bridge_contract.md`](patches/llm_wiki/bridge_contract.md) for
-the fork interface and apply both patches in [`patches/llm_wiki/`](patches/llm_wiki/).
+the fork interface and apply all four patches in [`patches/llm_wiki/`](patches/llm_wiki/).
 `paths.project_path` is one dedicated LLM Wiki project. In benchmark headless
 mode the hidden WebView initializes and opens it automatically; the runner waits
 for the authenticated readiness endpoint before starting and fully cleans and
-reuses the project between corpus groups.
+reuses the project between corpus groups. Ingestion uses out-of-project batch
+snapshots: retryable transport failures restore and rerun the whole batch, while
+discarded attempts and snapshot maintenance remain outside the primary insertion
+and deletion metrics and are reported separately for audit.
 
 ### Generic 0–4 LLM judge
 

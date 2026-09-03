@@ -1,0 +1,76 @@
+diff --git a/src/lib/llm-client.ts b/src/lib/llm-client.ts
+--- a/src/lib/llm-client.ts
++++ b/src/lib/llm-client.ts
+@@ -215,26 +215,30 @@ export async function streamChat(
+   let timeoutController: AbortController | undefined
+   let timeoutFired = false
+ 
+-  if (typeof AbortSignal.timeout === "function") {
+-    timeoutController = new AbortController()
+-    const timeoutId = setTimeout(() => {
+-      timeoutFired = true
++  // Do not gate the fallback timer on AbortSignal.timeout. Older WebKitGTK
++  // releases do not expose that static method even though AbortController and
++  // setTimeout work normally. Gating here silently disabled all request
++  // timeouts on those runtimes and allowed a dropped provider response to
++  // leave ingestion stuck forever.
++  timeoutController = new AbortController()
++  const timeoutId = setTimeout(() => {
++    timeoutFired = true
++    timeoutController?.abort()
++  }, timeoutMs)
++
++  if (signal) {
++    signal.addEventListener("abort", () => {
++      clearTimeout(timeoutId)
+       timeoutController?.abort()
+-    }, timeoutMs)
+-
+-    if (signal) {
+-      signal.addEventListener("abort", () => {
+-        clearTimeout(timeoutId)
+-        timeoutController?.abort()
+-      })
+-    }
+-    combinedSignal = timeoutController.signal
++    })
+   }
++  combinedSignal = timeoutController.signal
+ 
+   let response: Response
+   try {
+diff --git a/src/lib/llm-client.test.ts b/src/lib/llm-client.test.ts
+--- a/src/lib/llm-client.test.ts
++++ b/src/lib/llm-client.test.ts
+@@ -395,6 +395,31 @@ describe("streamChat — mid-stream abort mapping", () => {
+     expect(onError.mock.calls[0][0].message).toMatch(/timed out after 90 min/)
+   })
+ 
++  it("keeps the timeout active when AbortSignal.timeout is unavailable", async () => {
++    const descriptor = Object.getOwnPropertyDescriptor(AbortSignal, "timeout")
++    Object.defineProperty(AbortSignal, "timeout", {
++      configurable: true,
++      value: undefined,
++    })
++    try {
++      const { response, getReject, readCalled } = pendingStreamResponse()
++      mockHttpFetch.mockResolvedValue(response)
++      const onError = vi.fn()
++      const promise = streamChat(
++        cfg,
++        [{ role: "user", content: "hi" }],
++        { onToken: vi.fn(), onDone: vi.fn(), onError },
++      )
++      await readCalled
++      await vi.advanceTimersByTimeAsync(30 * 60 * 1000)
++      getReject()("Request cancelled")
++      await promise
++      expect(onError.mock.calls[0][0].message).toMatch(/timed out after 30 min/)
++    } finally {
++      if (descriptor) Object.defineProperty(AbortSignal, "timeout", descriptor)
++    }
++  })
++
+   it("treats a bare-string abort as a silent cancel when the backstop did NOT fire", async () => {
+     const { response, getReject, readCalled } = pendingStreamResponse()
+     mockHttpFetch.mockResolvedValue(response)

@@ -1,0 +1,240 @@
+diff --git a/src-tauri/src/api_server.rs b/src-tauri/src/api_server.rs
+index 35c709e..e99a3d4 100644
+--- a/src-tauri/src/api_server.rs
++++ b/src-tauri/src/api_server.rs
+@@ -2084,6 +2084,9 @@ fn handle_benchmark_create(app: &AppHandle, body: &str) -> ApiResponse {
+         .unwrap_or("")
+         .trim()
+         .to_string();
++    if value.get("continuation").and_then(Value::as_bool).is_none() {
++        return err(400, "continuation must be a boolean");
++    }
+     if corpus_id.is_empty() || project_path.is_empty() || value.get("config").is_none() {
+         return err(400, "corpusId, projectPath, and config are required");
+     }
+@@ -2195,6 +2198,16 @@ fn handle_benchmark_ingest(app: &AppHandle, run_id: &str, body: &str) -> ApiResp
+     {
+         return err(400, "documents must be a non-empty array of paths");
+     }
++    if value
++        .get("documentOffset")
++        .and_then(Value::as_u64)
++        .is_none()
++    {
++        return err(400, "documentOffset must be a non-negative integer");
++    }
++    if value.get("finalBatch").and_then(Value::as_bool).is_none() {
++        return err(400, "finalBatch must be a boolean");
++    }
+     value["runId"] = Value::String(run.id.clone());
+     value["corpusId"] = Value::String(run.corpus_id.clone());
+     value["projectPath"] = Value::String(run.project.path.clone());
+@@ -2353,13 +2366,26 @@ fn handle_benchmark_delete(app: &AppHandle, run_id: &str) -> ApiResponse {
+         "wiki".to_string(),
+         "media".to_string(),
+         "raw/parsed".to_string(),
+-        format!("raw/sources/.benchmark-{}", run.id),
+     ];
+     for relative in cleanup_paths {
+         if let Err(error) = remove_benchmark_path(&project_root.join(relative)) {
+             return err(500, error);
+         }
+     }
++    // A restart-safe batched run can use more than one in-memory benchmark
++    // run id. Remove every benchmark-owned staging directory from this
++    // dedicated project rather than leaking earlier batches under raw/sources.
++    let raw_sources = project_root.join("raw").join("sources");
++    if let Ok(entries) = fs::read_dir(&raw_sources) {
++        for entry in entries.flatten() {
++            let name = entry.file_name();
++            if name.to_string_lossy().starts_with(".benchmark-") {
++                if let Err(error) = remove_benchmark_path(&entry.path()) {
++                    return err(500, error);
++                }
++            }
++        }
++    }
+     let metadata = project_root.join(".llm-wiki");
+     if let Err(error) = remove_benchmark_path(&metadata) {
+         return err(500, error);
+diff --git a/src/lib/benchmark-bridge.ts b/src/lib/benchmark-bridge.ts
+index 1a93354..e6e182f 100644
+--- a/src/lib/benchmark-bridge.ts
++++ b/src/lib/benchmark-bridge.ts
+@@ -1,10 +1,11 @@
+ import { invoke } from "@tauri-apps/api/core"
+ import { listen, type UnlistenFn } from "@tauri-apps/api/event"
+-import { copyFile, createDirectory, listDirectory, openProject, writeFile } from "@/commands/fs"
++import { copyFile, createDirectory, listDirectory, openProject, readFile, writeFile } from "@/commands/fs"
+ import { beginBenchmarkLlmTelemetry, finishBenchmarkLlmTelemetry } from "./benchmark-telemetry"
+ import {
+   clearQueueState,
+   enqueueBatchAndWaitForSweep,
++  enqueueBatchAndWaitWithoutSweep,
+   setIngestWorkerLimit,
+ } from "./ingest-queue"
+ import { getFileName, normalizePath } from "./path-utils"
+@@ -189,6 +190,43 @@ async function restoreGeneralScaffold(projectPath: string) {
+   }
+ }
+ 
++async function inspectContinuedGeneralScaffold(projectPath: string) {
++  const pp = normalizePath(projectPath)
++  const template = getTemplate("general")
++  const requiredDefaults: Record<string, string> = {
++    "purpose.md": template.purpose,
++    "schema.md": template.schema,
++    "wiki/overview.md": GENERAL_OVERVIEW,
++  }
++  for (const [relative, expected] of Object.entries(requiredDefaults)) {
++    const actual = await readFile(`${pp}/${relative}`)
++    if (actual !== expected) {
++      throw new Error(`Continued benchmark project changed protected scaffold file: ${relative}`)
++    }
++  }
++  const structuralFiles = [
++    ...Object.keys(requiredDefaults),
++    "wiki/index.md",
++    "wiki/log.md",
++  ]
++  const hashes = Object.fromEntries(
++    await Promise.all(
++      structuralFiles.map(async (relative) => [
++        relative,
++        await sha256Text(await readFile(`${pp}/${relative}`)),
++      ]),
++    ),
++  )
++  return {
++    template: "general",
++    outputLanguage: "auto",
++    chunking: "official_default",
++    persistExtractedMarkdown: false,
++    continued: true,
++    fileSha256: hashes,
++  }
++}
++
+ export async function bootstrapBenchmarkProject() {
+   const config = await invoke<BenchmarkBootstrapConfig>("benchmark_bootstrap_config")
+   if (!config.enabled) return null
+@@ -233,7 +271,9 @@ async function configureRun(payload: Record<string, unknown>) {
+   }
+   const apiKey = state.llmConfig.apiKey.trim() || state.embeddingConfig.apiKey.trim()
+   if (!apiKey) throw new Error("Configure the Volcengine Ark API key in LLM Wiki first")
+-  const projectScaffold = await restoreGeneralScaffold(project.path)
++  const projectScaffold = payload.continuation === true
++    ? await inspectContinuedGeneralScaffold(project.path)
++    : await restoreGeneralScaffold(project.path)
+ 
+   const llm = {
+     ...state.llmConfig,
+@@ -308,9 +348,14 @@ async function ingestRun(payload: Record<string, unknown>) {
+   const project = requireActiveProject(payload.projectPath)
+   const runId = String(payload.runId ?? "")
+   const documents = payload.documents
++  const documentOffset = Number(payload.documentOffset ?? 0)
++  const finalBatch = payload.finalBatch !== false
+   if (!runId || !Array.isArray(documents) || documents.length === 0) {
+     throw new Error("Benchmark ingest requires runId and at least one document")
+   }
++  if (!Number.isSafeInteger(documentOffset) || documentOffset < 0) {
++    throw new Error("Benchmark ingest documentOffset must be a non-negative integer")
++  }
+ 
+   const stagingDir = `${normalizePath(project.path)}/raw/sources/.benchmark-${runId}`
+   await createDirectory(stagingDir)
+@@ -321,7 +366,7 @@ async function ingestRun(payload: Record<string, unknown>) {
+     }
+     const name = getFileName(normalizePath(source))
+     if (!name) throw new Error(`Benchmark document has no file name: ${source}`)
+-    const destination = `${stagingDir}/${String(index).padStart(5, "0")}-${name}`
++    const destination = `${stagingDir}/${String(documentOffset + index).padStart(5, "0")}-${name}`
+     await copyFile(source, destination)
+     staged.push({ sourcePath: destination, folderContext: "" })
+   }
+@@ -333,8 +378,12 @@ async function ingestRun(payload: Record<string, unknown>) {
+   let sweepCompleted = false
+   let operationError: unknown
+   try {
+-    await enqueueBatchAndWaitForSweep(project.id, staged)
+-    sweepCompleted = true
++    if (finalBatch) {
++      await enqueueBatchAndWaitForSweep(project.id, staged)
++      sweepCompleted = true
++    } else {
++      await enqueueBatchAndWaitWithoutSweep(project.id, staged)
++    }
+   } catch (error) {
+     operationError = error
+   }
+@@ -354,6 +403,9 @@ async function ingestRun(payload: Record<string, unknown>) {
+       embeddingTokens: rustUsage.embeddingTokens,
+     },
+     reviewSweepCompleted: sweepCompleted,
++    finalBatch,
++    documentOffset,
++    documentCount: staged.length,
+     embeddingDimensions: 1024,
+   }
+ }
+diff --git a/src/lib/ingest-queue.ts b/src/lib/ingest-queue.ts
+index 5904120..bf4159a 100644
+--- a/src/lib/ingest-queue.ts
++++ b/src/lib/ingest-queue.ts
+@@ -74,6 +74,7 @@ let processedSinceDrain = false
+ interface DrainWaiter {
+   projectId: string
+   taskIds: string[]
++  runReviewSweep: boolean
+   resolve: (resolvedReviews: number) => void
+   reject: (error: Error) => void
+ }
+@@ -345,10 +346,28 @@ export async function enqueueBatch(
+ export async function enqueueBatchAndWaitForSweep(
+   projectId: string,
+   files: Array<{ sourcePath: string; folderContext: string }>,
++): Promise<number> {
++  return enqueueBatchAndWait(projectId, files, true)
++}
++
++/** Benchmark-only synchronization point for a non-final ingest batch.
++ * Resolves when all sources finish, but deliberately defers the project-wide
++ * review sweep until the final batch. */
++export async function enqueueBatchAndWaitWithoutSweep(
++  projectId: string,
++  files: Array<{ sourcePath: string; folderContext: string }>,
++): Promise<number> {
++  return enqueueBatchAndWait(projectId, files, false)
++}
++
++async function enqueueBatchAndWait(
++  projectId: string,
++  files: Array<{ sourcePath: string; folderContext: string }>,
++  runReviewSweep: boolean,
+ ): Promise<number> {
+   const taskIds = await enqueueBatch(projectId, files)
+   return new Promise<number>((resolve, reject) => {
+-    drainWaiters.push({ projectId, taskIds, resolve, reject })
++    drainWaiters.push({ projectId, taskIds, runReviewSweep, resolve, reject })
+     processNext(projectId)
+   })
+ }
+@@ -968,10 +987,14 @@ async function onQueueDrained(projectId: string, projectPath: string, epoch: num
+   const signal = sweepAbortController.signal
+ 
+   try {
+-    const { sweepResolvedReviews } = await import("@/lib/sweep-reviews")
+-    if (currentProjectId !== projectId || queueEpoch !== epoch) return
+-    const resolvedReviews = await sweepResolvedReviews(projectPath, signal)
+     const matching = drainWaiters.filter((waiter) => waiter.projectId === projectId)
++    const runReviewSweep = matching.length === 0 || matching.some((waiter) => waiter.runReviewSweep)
++    let resolvedReviews = 0
++    if (runReviewSweep) {
++      const { sweepResolvedReviews } = await import("@/lib/sweep-reviews")
++      if (currentProjectId !== projectId || queueEpoch !== epoch) return
++      resolvedReviews = await sweepResolvedReviews(projectPath, signal)
++    }
+     const failures = queue.filter((task) =>
+       task.projectId === projectId &&
+       task.status === "failed" &&

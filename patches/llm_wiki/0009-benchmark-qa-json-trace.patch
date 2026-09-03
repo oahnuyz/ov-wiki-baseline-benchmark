@@ -1,0 +1,222 @@
+--- a/src-tauri/src/api_server.rs
++++ b/src-tauri/src/api_server.rs
+@@ -1,12 +1,12 @@
+ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+-use std::fs;
+-use std::io::{Cursor, Read};
++use std::fs::{self, OpenOptions};
++use std::io::{Cursor, Read, Write};
+ use std::path::{Component, Path, PathBuf};
+ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+ use std::sync::mpsc::{self, Receiver, SyncSender};
+-use std::sync::{Mutex, OnceLock};
++use std::sync::{Arc, Mutex, OnceLock};
+ use std::thread;
+-use std::time::{Duration, Instant};
++use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+ 
+ use futures::FutureExt;
+ use serde::{Deserialize, Serialize};
+@@ -2283,17 +2283,54 @@
+         .and_then(Value::as_str)
+         .unwrap_or("")
+         .to_string();
++    let mut prepared = match prepare_chat(app, &run.project.id, body) {
++        Ok(prepared) => prepared,
++        Err(response) => return response,
++    };
++    let trace_path = match benchmark_trace_path(&run, &session_id) {
++        Ok(path) => path,
++        Err(error) => {
++            app.state::<agent::cancel::AgentCancellationRegistry>()
++                .finish(&prepared.project.id, &prepared.session_id, &prepared.run_id);
++            return err(500, error);
++        }
++    };
++    let event_sink = match benchmark_trace_sink(&trace_path) {
++        Ok(sink) => sink,
++        Err(error) => {
++            app.state::<agent::cancel::AgentCancellationRegistry>()
++                .finish(&prepared.project.id, &prepared.session_id, &prepared.run_id);
++            return err(500, error);
++        }
++    };
+     let stage = format!("qa:{}:{session_id}", run.id);
+     if let Err(error) = benchmark::begin(&stage) {
++        app.state::<agent::cancel::AgentCancellationRegistry>()
++            .finish(&prepared.project.id, &prepared.session_id, &prepared.run_id);
+         return err(409, error);
+     }
+     let started = Instant::now();
+-    let response = handle_chat(app, &run.project.id, body);
++    let result = tauri::async_runtime::block_on(prepared.runtime.run_once_with_cancel_and_events(
++        std::mem::take(&mut prepared.request),
++        prepared.cancellation.take(),
++        Some(event_sink),
++    ));
++    app.state::<agent::cancel::AgentCancellationRegistry>()
++        .finish(&prepared.project.id, &prepared.session_id, &prepared.run_id);
+     let duration = started.elapsed().as_secs_f64();
+     let usage = match benchmark::finish(&stage) {
+         Ok(usage) => usage,
+         Err(error) => return err(500, error),
+     };
++    let response = match result {
++        Ok(response) => {
++            persist_chat_response(app, &prepared, &response);
++            ok(external_chat_response(response))
++        }
++        Err(error) if error == "message is required" => err(400, error),
++        Err(error) if error == "Agent turn cancelled" => err(499, error),
++        Err(error) => err(502, error),
++    };
+     if response.status != 200 {
+         return response;
+     }
+@@ -2325,6 +2362,57 @@
+         },
+         "references": response.body.get("references").cloned().unwrap_or_else(|| json!([])),
+         "trace": response.body.get("events").cloned().unwrap_or_else(|| json!([])),
++        "traceLogPath": trace_path.to_string_lossy(),
++    }))
++}
++
++fn benchmark_trace_path(run: &BenchmarkRun, session_id: &str) -> Result<PathBuf, String> {
++    let safe_session = session_id.len() <= 240
++        && !session_id.is_empty()
++        && session_id
++            .chars()
++            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character));
++    if !safe_session {
++        return Err("Benchmark sessionId is not safe for a trace file name".to_string());
++    }
++    Ok(PathBuf::from(&run.project.path)
++        .join(".llm-wiki")
++        .join("benchmark-traces")
++        .join(&run.id)
++        .join(format!("{session_id}.jsonl")))
++}
++
++fn benchmark_trace_sink(path: &Path) -> Result<agent::runtime::AgentEventSink, String> {
++    let parent = path
++        .parent()
++        .ok_or_else(|| "Benchmark trace path has no parent".to_string())?;
++    fs::create_dir_all(parent)
++        .map_err(|error| format!("Failed to create benchmark trace directory: {error}"))?;
++    let file = OpenOptions::new()
++        .create_new(true)
++        .write(true)
++        .open(path)
++        .map_err(|error| format!("Failed to create benchmark trace file: {error}"))?;
++    let file = Arc::new(Mutex::new(file));
++    Ok(Arc::new(move |mut event: agent::events::AgentEvent| {
++        event.redact_for_external_api();
++        let mut value = match serde_json::to_value(event) {
++            Ok(value) => value,
++            Err(_) => return,
++        };
++        if let Some(object) = value.as_object_mut() {
++            let observed_at_unix_ms = SystemTime::now()
++                .duration_since(UNIX_EPOCH)
++                .map(|duration| duration.as_millis() as u64)
++                .unwrap_or(0);
++            object.insert("observedAtUnixMs".to_string(), json!(observed_at_unix_ms));
++        }
++        if let Ok(mut file) = file.lock() {
++            if serde_json::to_writer(&mut *file, &value).is_ok() {
++                let _ = file.write_all(b"\n");
++                let _ = file.flush();
++            }
++        }
+     }))
+ }
+ 
+--- a/src-tauri/src/agent/runtime.rs
++++ b/src-tauri/src/agent/runtime.rs
+@@ -1489,6 +1489,21 @@
+                     )),
+                 },
+             );
++            emit_event(
++                &mut events,
++                &event_sink,
++                AgentEvent::tool_start(
++                    "llm.generate",
++                    Some(format!(
++                        "iteration={}/{} provider={} model={} mustFinalize={}",
++                        iteration + 1,
++                        max_iterations,
++                        client.provider_name(),
++                        client.model_name(),
++                        must_finalize,
++                    )),
++                ),
++            );
+             // Images are only sent on the first model turn. Tool observations
+             // after that contain text results; resending large base64 images
+             // on each loop iteration would multiply cost and latency.
+@@ -1511,6 +1526,11 @@
+                                 status: "completed".to_string(),
+                                 detail: None,
+                             },
++                        );
++                        emit_event(
++                            &mut events,
++                            &event_sink,
++                            AgentEvent::tool_end("llm.generate", None),
+                         );
+                         raw
+                     }
+@@ -1528,6 +1548,11 @@
+                         emit_event(
+                             &mut events,
+                             &event_sink,
++                            AgentEvent::tool_end("llm.generate", Some(err.clone())),
++                        );
++                        emit_event(
++                            &mut events,
++                            &event_sink,
+                             AgentEvent::Error {
+                                 message: err.clone(),
+                             },
+--- a/src-tauri/src/agent/provider.rs
++++ b/src-tauri/src/agent/provider.rs
+@@ -82,6 +82,7 @@
+ pub struct LlmClient {
+     config: LlmConfig,
+     client: reqwest::Client,
++    structured_json: bool,
+ }
+ 
+ pub trait AgentLlmProvider: Send + Sync {
+@@ -142,7 +143,11 @@
+             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+             .build()
+             .map_err(|err| format!("Failed to build LLM HTTP client: {err}"))?;
+-        Ok(Self { config, client })
++        Ok(Self {
++            config,
++            client,
++            structured_json: false,
++        })
+     }
+ 
+     pub async fn generate_text(
+@@ -316,6 +321,9 @@
+         if crate::benchmark::is_active() {
+             body["temperature"] = json!(0);
+         }
++        if self.structured_json && crate::benchmark::is_active() {
++            body["response_format"] = json!({ "type": "json_object" });
++        }
+         adapt_openai_strict_completion_body(&mut body, &self.config);
+         apply_openai_reasoning(&mut body, &self.config);
+         body
+@@ -616,6 +624,7 @@
+         Self {
+             config,
+             client: self.client.clone(),
++            structured_json: true,
+         }
+     }
+ 

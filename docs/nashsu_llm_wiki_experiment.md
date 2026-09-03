@@ -13,12 +13,22 @@
 - 补丁顺序：
   1. `patches/llm_wiki/0001-volcengine-thinking-and-dimension.patch`
   2. `patches/llm_wiki/0002-benchmark-bridge-and-telemetry.patch`
+  3. `patches/llm_wiki/0003-webkit-request-timeout-fallback.patch`
+  4. `patches/llm_wiki/0004-restart-safe-batched-ingest.patch`
+  5. `patches/llm_wiki/0005-partial-ingest-usage-and-doubao-dimensions.patch`
+  6. `patches/llm_wiki/0006-restore-empty-project-after-delete.patch`
+  7. `patches/llm_wiki/0007-reactivate-empty-project-after-delete.patch`
+  8. `patches/llm_wiki/0008-searchable-only-deletion-telemetry.patch`
+  9. `patches/llm_wiki/0009-benchmark-qa-json-trace.patch`
 - Python 实验入口：`ov-wiki-nashsu`
 - 固定配置：`baseline_configs/nashsu_llm_wiki.yaml`
 
 `0001` 负责 Volcengine 关闭深度思考的请求格式以及 1024 维 embedding 的强校验；
 `0002` 增加只用于 benchmark 的本地控制接口、真实 token telemetry、完整入库等待、
-独立 QA 和定向清理能力。补丁不替换 Nashsu 的知识生成、Agent 或检索算法。
+独立 QA 和定向清理能力；`0003` 为旧 WebKitGTK 补齐单次 provider 请求 timeout；`0004`
+增加分批 drain、受校验的跨重启续批和跨 run staging 清理；`0005`–`0008` 完善部分 token、
+1024 维 embedding 与删除边界；`0009` 只在 benchmark Agent 决策中请求严格 JSON，并把实时
+QA 事件落盘。补丁不替换 Nashsu 的知识生成、Agent 或检索算法。
 
 ## 2. 两类 token：bridge token 与 Ark API key
 
@@ -162,7 +172,13 @@ runner 将一个实验全部文档的 `sha256` 排序后串联，再计算 corpu
 | thinking | 开/关/不同预算 | `disabled` | 向 Ark 发送 `thinking: {"type":"disabled"}` |
 | streaming | 开/关 | 关 | 非流式响应才能稳定取得完整 provider usage |
 | ingest worker | 1–5 | `1` | corpus 文档串行处理，避免上下文和计时相互污染 |
+| 入库批大小 | 正整数 | `25` 篇 | 每批保持同一知识库，批间重启 WebKit 服务以释放进程 mappings |
+| 批间服务重启 | 开/关 | 开 | 非最终批完成后自动重启；最终批完成后不重启，直接进入 QA |
+| 网络失败批次重试 | 非负整数 | 最多 `2` 次 | Nashsu 内部重试耗尽后，恢复批前快照并整批重跑 |
+| 批次快照目录 | 项目外路径 | `~/nashsu-llm-wiki-baseline/snapshots` | 不参与检索，正常/失败/中止时清理 |
 | QA worker | 可并行 | `1` | 逐题串行 |
+| 单题 QA timeout | 正整数 | `600` 秒 | 仅限制一次问答 HTTP 尝试，不改变 Agent 内部 8 轮预算 |
+| 单题 QA 自动重试 | 非负整数 | 最多 `2` 次 | 仅网络/timeout/QA usage 不完整时重启服务并用新会话重答当前题 |
 | Judge worker | 可并行 | `1` | 逐题串行，与参考 baseline 对齐 |
 | PDF 解析 | 内置 / MinerU Cloud / MinerU Local | 内置 | MinerU 强制关闭 |
 | 图片 caption | 开/关、主模型/独立模型 | 开，复用主 LLM | caption 并发数固定为 4 |
@@ -174,16 +190,19 @@ runner 将一个实验全部文档的 `sha256` 排序后串联，再计算 corpu
 | parsed Markdown 副本 | 开/关 | 关 | 固定 `persistExtractedMarkdown=false` |
 | headless 启动 | 可见桌面 / 隐藏 WebView | 隐藏 WebView | Xvfb 中保留官方前端入库链路，不需要人工点击 |
 | startup timeout | 可配置 | `300` 秒 | runner 等待 bridge 和专用项目就绪；不计入实验时间 |
-| bridge timeout | 可配置 | `1800` 秒 | 当前 YAML 对单次 HTTP 请求的超时 |
+| bridge timeout | 可配置 | `129600` 秒（36 小时） | 用于长入库请求；单题 QA 使用独立的 600 秒上限 |
 
 ### 5.2 Agent mode 与 retrieval mode 是两个独立参数
 
 `mode` 控制 Agent loop 的总决策预算；`retrievalMode` 控制检索策略。此前用户所说的
-“使用 standard”在本实验中明确落实为两个相互独立且都采用官方默认值的选择：
+“使用 standard”在本实验中明确落实为两个相互独立的选择；检索算法仍为 Standard，
+但从本次重跑起只在 benchmark bridge 中扩大循环预算：
 
 ```text
 mode = standard
 retrievalMode = standard
+maxAgentIterations = 20
+maxRetrievalActions = 15
 ```
 
 Agent mode 的可选值为：
@@ -191,7 +210,7 @@ Agent mode 的可选值为：
 | Agent mode | 无 skills 时的最多 Agent 轮次 | `retrievalMode=standard` 时的最多检索动作 | 主要区别 |
 |---|---:|---:|---|
 | `fast` | 4 | 2 | 较小的工具与回答预算 |
-| `standard` | 8 | 4 | 官方默认 Agent loop |
+| `standard` | 8（本实验覆盖为 20） | 4（本实验覆盖为 15） | 官方 Standard 算法；仅 benchmark 扩大预算 |
 | `deep` | 12 | 8 | 更大预算，并更积极纳入原始来源或已开启的外部工具 |
 | `local_first` | 8 | 4 | 固定版本中预算与 Standard 相同；当前源码未显示另一套实质性检索算法 |
 
@@ -199,7 +218,7 @@ Retrieval mode 的可选值为：
 
 | Retrieval mode | `mode=standard` 时的最多检索动作 | 行为 |
 |---|---:|---|
-| `standard` | 4 | 模型在预算内自行决定搜什么、读什么和何时回答 |
+| `standard` | 4（本实验覆盖为 15） | 模型在预算内自行决定搜什么、读什么和何时回答 |
 | `smart` | 4 | 每次观察后识别尚缺证据，修改查询，抑制近似重复；连续两次没有新增证据时强制结束检索 |
 | `faithful` | 3 | 只以 raw source excerpt 或显式附件为证据，排除生成 Wiki、overview/schema、Web 和 AnyTXT |
 
@@ -210,10 +229,11 @@ Retrieval mode 的可选值为：
 ### 5.3 Nashsu Standard Agent loop 的具体含义
 
 在固定版本中，只要后端 LLM 可用，Standard 模式进入 **模型驱动的 Agent loop**，而不是
-固定执行一次检索再回答：
+固定执行一次检索再回答。官方默认是 8 轮 / 4 次检索；本实验重跑的 benchmark-only
+覆盖值为：
 
-- 最多 8 次 Agent 迭代；
-- `retrieval_mode=standard` 且没有 skills 时，最多 4 个检索工具动作；
+- 最多 20 次 Agent 迭代；
+- `retrieval_mode=standard` 且没有 skills 时，最多 15 个检索工具动作；
 - 每一轮 LLM 输出紧凑 JSON，选择一个工具动作或直接输出 final answer；
 - 可用的内部检索工具主要是 `wiki.search` 与 `wiki.read_page`；
 - 工具结果作为 observation 回到下一轮；
@@ -274,13 +294,24 @@ runner 先校验 prepared 数据和共享 corpus fingerprint。bridge 创建 run
 - 固定版本、模型、检索、caption、PDF 和 embedding manifest 完全一致；
 - 项目没有被另一个 benchmark run 占用。
 
-每个 corpus 文件随后复制到：
+每个 corpus 文件按 prepared 清单顺序分批复制到：
 
 ```text
 <project>/raw/sources/.benchmark-<run_id>/
 ```
 
-**文件复制不计入入库时间。** staging 完成后才启动计时和 token telemetry。
+**文件复制不计入入库时间。** 每一批 staging 完成后才启动该批计时和 token telemetry。
+默认每批 25 篇、并发仍为 1。非最终批只等待本批队列完全 drain，不运行 review sweep；
+随后 runner 重启整个 headless 服务、等待 readiness，并以显式 `continuation=true` 创建同一
+corpus 的续批 run。续批接口会校验 `purpose.md`、`schema.md` 和 `overview.md` 仍是未经人工
+编辑的 General 默认文件，并保留前批生成的 Wiki 页面、索引、向量库、review 和 ingest cache。
+因此这是进程资源的分段释放，不是知识库清空或断点跳过。
+
+每批开始前，runner 在项目目录之外创建完整项目快照。如果 Nashsu 内部最多 3 次任务重试
+仍因网络发送错误、连接中断或 timeout 耗尽，runner 会停止整个服务、恢复到该批开始前的
+快照、重启服务并整批重跑，最多额外重跑 2 次。配置、解析、维度、telemetry 等非网络错误
+不自动重跑。恢复整个批次可保证失败尝试留下的 caption cache、Wiki 文件、review、索引或
+LanceDB 写入不会被下一次尝试复用。
 
 ### 7.2 串行队列与解析
 
@@ -320,7 +351,8 @@ caption cache 以“图片字节 SHA-256 + 输出语言”为 key，存放在
 Nashsu 对每个源执行核心两阶段 LLM 入库。Markdown 页面不是等所有源完成后统一生成：在
 worker=1 下，每份文档依次完成“解析 → caption → analysis → generation → 写页/合并 →
 更新 index → embedding”，然后才处理下一份文档。因此后面的文档能够读取前面文档已经
-生成的页面和更新后的 index。全部文档都完成后才运行一次 review sweep。
+生成的页面和更新后的 index；这一点跨服务重启和跨批次保持不变。全部文档都完成后才运行
+一次 review sweep。
 
 #### 阶段 1：Analysis
 
@@ -379,7 +411,8 @@ batch size=1，但尚未显式清空已有项目的 chunk 长度覆盖值。
 
 ### 7.6 Review sweep
 
-只有所有 corpus 任务结束、队列 drain 后，入库轮才继续执行 review sweep。sweep 分两级：
+只有最终批的所有 corpus 任务结束、队列 drain 后，入库轮才执行唯一一次 review sweep。
+中间批次不会执行 sweep。sweep 分两级：
 
 1. **规则级清理**：例如 missing-page 对应页面已存在，或 duplicate 涉及页面已变化；
 2. **LLM 语义判断**：对剩余 review 保守判断是否已被新 Wiki 内容解决。
@@ -387,8 +420,18 @@ batch size=1，但尚未显式清空已有项目的 chunk 长度覆盖值。
 LLM sweep 每批最多 40 个 review，最多 5 批；prompt 最多列出 300 个 Wiki 页面。如果一批
 没有解决任何 review，会提前停止后续批次。
 
-**入库结束时间点是 review sweep 完成并收集完 provider usage 之后。** 这意味着入库时间
-包括解析、图片提取/caption、知识生成、文件写入、页面 embedding 和完整 review sweep。
+**入库结束时间点是最终 review sweep 完成并收集完 provider usage 之后。** 主指标
+`Total Insertion Time` 是各批 active duration 之和，包含解析、图片提取/caption、知识生成、
+文件写入、页面 embedding 和最终完整 review sweep，但不包含 staging 与批间服务重启。
+报告另列 `Operational Wall Clock Time Including Restarts`，表示从第一批开始到最终批完成的
+实际墙钟时间，包含批间重启与 readiness 等待。这样既保持原 baseline 的入库计时边界，又
+透明记录为规避 WebKit mappings 上限而付出的运行开销。
+
+若某批发生自动回滚，主指标只累加该批最终成功尝试的 `durationSeconds` 和真实 provider
+usage；被回滚尝试的时间和 token 不进入 `Total Insertion Time` 或
+`Total Insertion Token Cost`。其墙钟耗时、错误、run ID、usage 是否可得会写入
+`discarded_ingest_attempts`。网络错误没有 provider 响应时，失败尝试 token 记为
+`null / usage_complete=false`，不估算为 0。快照创建、恢复和清理时间也只进入审计字段。
 
 ### 7.7 入库 token
 
@@ -398,10 +441,12 @@ LLM sweep 每批最多 40 个 review，最多 5 批；prompt 最多列出 300 �
 - LLM output tokens：上述调用的 completion tokens；
 - embedding tokens：所有页面 chunk embedding 调用。
 
-不使用字符数估算。任何已发出的模型/embedding 请求如果没有可解析的 usage，整个入库请求
-标记为 telemetry incomplete，并使 benchmark 失败。bridge 没有额外添加重试；Nashsu 原生
-ingest queue 仍保留最多 3 次任务重试和 embedding oversize 缩半重试。若发生这些重试，
-计时包含重试耗时，telemetry 的 fail-closed 检查也不会把失败调用静默忽略。
+不使用字符数估算。某个成功的模型/embedding 请求如果没有可解析的 usage，该批仍完成，
+但标记为 telemetry incomplete；该批其他请求已返回的 usage 会原样返回并累计为已知下界，
+不会把整批改记为 0。Nashsu 原生 ingest queue 仍保留最多 3 次任务重试和 embedding
+oversize 缩半重试；这些内部重试属于一次批次尝试，若最终成功，其时间和所有可报告 usage
+均计入该成功尝试。如果内部重试最终因可重试网络错误耗尽，则由外层
+快照机制回滚整批，并从主要指标中排除整个失败批次尝试。
 
 ## 8. 第二轮：QA 问答轮
 
@@ -424,22 +469,26 @@ Question: {question}
 - `tools={wiki: true, web: false, anytxt: false}`
 - `mode=standard`
 - `retrievalMode=standard`
+- `maxAgentIterations=20`
+- `maxRetrievalActions=15`
 - 不发送 `topK`
 
 因此不会读取上一题对话，也不会把本题写入持久化聊天历史。所有题串行运行。
 
 ### 8.2 Standard Agent 如何决定检索
 
-Agent 先构造项目上下文和工具说明，然后由同一主 LLM 在最多 8 次循环内选择动作：
+Agent 先构造项目上下文和工具说明，然后由同一主 LLM 在最多 20 次循环内选择动作：
 
 - `wiki.search(query, topK=5)`：对生成 Wiki 做混合检索；
 - `wiki.read_page(path)`：读取已找到的完整 Wiki 页面；
+- `source.search(query, topK≤10)`：关键词扫描当前 corpus 的原始 source excerpt；
+- `graph.search(query)`：由 Wiki frontmatter 与 wikilink 构图后检索直接关系；
 - `final(answer)`：结束并回答。
 
-Web、AnyTXT 和 skills 不可用，写 Wiki 也不是本轮授权行为。Standard retrieval budget 为 4；
+Web、AnyTXT 和 skills 不可用，写 Wiki 也不是本轮授权行为。本实验 Standard retrieval budget 为 15；
 达到预算后系统强制进入 final-only prompt。
 
-“最多 8 次循环”统计所有模型决策，不只是检索。一次循环只能选择一个工具动作或 final。
+“最多 20 次循环”统计所有模型决策，不只是检索。一次循环只能选择一个工具动作或 final。
 例如 `wiki.search → wiki.read_page → final` 是 3 轮、2 个检索动作。检索预算统计
 `wiki.search`、`wiki.read_page`、`source.search`、`graph.search`、`web.search` 和
 `anytxt.search`；`top_k=5` 只表示一次 `wiki.search` 最多返回 5 个结果，不表示最多搜索
@@ -518,6 +567,10 @@ Agent prompt 会组合：
 `{"action":"final","answer":"..."}`，bridge 提取 answer。主模型、temperature、thinking 和
 非流式设置与入库轮一致。
 
+为降低 Agent action 被截断或附带非 JSON 文本的概率，benchmark 激活时会在 Agent 的结构化
+决策请求中加入 OpenAI-compatible `response_format={"type":"json_object"}`。该设置不作用于
+普通非 benchmark 会话，也不改变最终用户回答内容的格式。
+
 ### 8.5 QA 时间与 token
 
 单题 `durationSeconds` 从 Rust Agent 调用前开始，到最终 answer 和 provider usage 收集完成后
@@ -538,6 +591,16 @@ QA token 分为：
 - `searchInputTokens` / `searchOutputTokens`：为兼容参考 baseline 保留的独立搜索 LLM 槽位；
   Nashsu 当前混合检索没有独立 search LLM，因此这两个值为 0；
 - `embeddingTokens`：检索 query embedding usage。
+
+每个 Agent 事件还会立即追加并 flush 到项目下的
+`.llm-wiki/benchmark-traces/<run-id>/<session-id>.jsonl`。其中包含每轮 `llm.generate` 的开始、
+结束及工具事件，所以即使请求超时或进程被停止，也能判断卡在哪一轮。成功 QA 的路径写入
+逐题结果 `trace_log_path`。
+
+若单题发生网络错误、HTTP timeout，或 QA provider usage 不完整，runner 最多自动恢复两次：
+停止并重启服务、创建同 corpus 的 continuation run，然后以全新 `sessionId` 重答当前题。
+失败尝试的墙钟时间、恢复时间和未知 token 不进入正式平均 QA 时间/Token；它们单独写入
+`qa_retry_audit.json`。成功尝试仍必须有完整真实 usage，否则不会被计入正式结果。
 
 ## 9. 第三轮：评测轮
 
@@ -580,25 +643,26 @@ Judge 的 provider token 单独写入 `judge_telemetry.json`。它不计入“�
 
 ## 10. 删除轮
 
-一个共享 corpus 的所有实验变体完成 QA 与 Judge 后，只执行一次删除。计时从删除操作开始，
-覆盖前端内存状态清理和文件系统清理。
+一个共享 corpus 的所有实验变体完成 QA 与 Judge 后，只执行一次删除。删除分为计时前停写、
+可检索数据删除、计时后清理/恢复三段，主指标只采用中间一段。
 
-删除内容包括：
+主指标计时内容只有：
 
-- `wiki/` 生成页面；
-- `media/`；
-- `raw/parsed/`；
-- 本 run 的 `raw/sources/.benchmark-<run_id>/` staged corpus；
-- `.llm-wiki/` 下的 review、caption cache、ingest cache、向量/索引和其他运行状态。
+- `wiki/` 中除 `wiki/media/` 外的页面，也同时消除由页面关系产生的图候选；
+- 可被 `source.search` 访问的 `raw/sources/` 数据，包括本次 benchmark 自有的隐藏 staging；
+- `.llm-wiki/lancedb/` 中的页面和分块向量。
+
+queue/review/lint 的前端停写与清空在计时前完成。`wiki/media`、根 `media/`、`raw/parsed/`、
+其他不可检索隐藏数据、caption/ingest/review/lint 等缓存和其余 `.llm-wiki` 元数据在
+计时后清理。这些内容仍会被彻底删除，只是不属于可检索数据删除主指标。
 
 系统在删除前验证项目 ID 没有变化、项目路径为绝对安全路径，并且只操作 run 注册的专用
-项目。删除 `.llm-wiki/` 后恢复原项目的 `project.json`，以便下一 corpus 组复用同一项目。
-`purpose.md` 和 `schema.md` 不删除。
+项目。`purpose.md` 和 `schema.md` 不删除。
 
-删除整个 `wiki/` 也会删除初始 `index.md`、`overview.md` 和 `log.md`。为了保证第一个 corpus
-与后续 corpus 初始状态一致，下一 corpus 创建 run 时必须在入库计时开始前恢复官方 General
-脚手架；不能让第一次使用项目时存在占位文件、后续轮次却不存在。脚手架恢复属于实验环境
-初始化，不计入 corpus 入库时间，也不能携带上一 corpus 的任何内容。
+删除 Wiki 页面也会删除初始 `index.md`、`overview.md` 和 `log.md`。可检索页面、raw-source
+搜索数据和向量删除后立即停止主计时。此后才清理非检索状态、恢复 `project.json` 和官方
+General 脚手架并尝试重新打开项目；必要的 WebKit 重启也发生在计时外。这保证下一个
+corpus 的初始状态一致，同时不把停写、缓存清理或环境恢复时间算作删除时间。
 
 删除不调用 LLM 或 embedding，因此：
 
@@ -653,14 +717,27 @@ F1        = 2 × precision × recall / (precision + recall)
 
 ```text
 Total Insertion Time
-  = 首个源开始进入 Nashsu ingest pipeline
-    到所有源、页面 embedding 和 review sweep 完成的墙钟时间
+  = Σ 每批 active duration
+  = 所有解析、caption、知识生成、写入、页面 embedding
+    加最终唯一一次 review sweep 的时间
 
 Total Insertion Token Cost
   = ingest_input_tokens + ingest_output_tokens + ingest_embedding_tokens
 ```
 
-文件 staging/copy 不计时。报告同时记录源文档数和 `Includes Review Sweep=true`。
+每批都会返回并累计所有成功请求中已经获得的 provider usage。若该批仍有成功请求未返回
+usage，则 `Token Usage Complete=false`，精确的 `Total Insertion Token Cost` 记为 `null`，
+同时 `Known Input/Output/Embedding Tokens (Lower Bound)` 和
+`Known Insertion Token Cost (Lower Bound)` 保留并累加已知值；不会再把整批 Token 置为 0。
+
+文件 staging/copy 和批间服务重启不计入主指标。报告同时记录实际 operational wall clock、
+源文档数、批大小、批数、重启次数、`Ingest Concurrency=1`、
+`Includes Review Sweep=true` 和 `Review Sweep Count=1`。以 PaperScope 93 篇为例，默认形成
+25/25/25/18 四批，批间重启 3 次，最终只 sweep 1 次。
+
+发生回滚时还记录 `Batch Retry Count`、`Discarded Retry Time`、失败 usage 可用性、
+`Snapshot Creation/Restore/Cleanup Time` 和计划/重试两类重启次数。这些审计字段均不进入
+主要入库指标。
 
 ### 11.5 QA 效率
 
@@ -683,9 +760,17 @@ Total QA Token Cost
 ### 11.6 删除效率
 
 ```text
-Total Deletion Time = 清除前端状态和全部本轮持久化数据的墙钟时间
+Total Deletion Time = 删除当前 corpus 的可检索页面/raw-source 数据/向量的墙钟时间
 Total Deletion Token Cost = 0
 ```
+
+报告另列 `Frontend Quiescence Time` 与 `Post-Deletion Cleanup and Recovery Time`。前者覆盖
+queue/review/lint 停写清理，后者覆盖 media、parsed、不可检索隐藏数据、缓存/元数据、项目恢复和
+run registry 清理；两者都不进入 `Total Deletion Time`。必要的 WebKit 服务重启也在主指标外。
+
+批次快照位于项目外，且通常在每批最终成功后立即删除；异常退出遗留的快照会在下次运行
+开始前清理。所有快照清理也发生在删除指标计时之外，其耗时只记为
+`Snapshot Cleanup Time`。
 
 ## 12. 输出文件
 
@@ -724,30 +809,42 @@ Total Deletion Token Cost = 0
 - `maxContextSize` 不是官方默认 204800；
 - bridge 未报告 `top_k=5`；
 - embedding 返回向量维度不是 1024；
-- 入库或 QA 中任何已发出 provider 请求缺失真实 usage；
+- QA 中任何已发出 provider 请求缺失真实 usage；该次尝试可按上述策略恢复，但不作为成功样本；
+- 入库允许部分成功请求缺失 usage，但必须保留其他请求的已知 Token，并将完整性标为 false；
 - QA 返回空 answer 或缺少 session ID；
 - 删除产生任何非零模型/embedding token；
 - bridge token 缺失或错误；
 - headless bridge listener 或指定项目在 300 秒内未就绪；
 - headless 项目目录非空但不是有效 LLM Wiki 项目。
 
-## 14. 真实实验前仍需实施或验证的事项
+入库中若模型生成的 Wiki `FILE` 块被截断，LLM Wiki 会先执行其内置单文件修复；若仍报告
+`truncated wiki file(s) could not be repaired`，runner 将其视为可重试批次错误：丢弃该次
+时间与未知 Token、恢复批次前快照、重启服务并完整重跑当前批次，最多沿用
+`max_batch_retries=2`。这不把不完整页面当作成功入库结果。
+
+## 14. 部署验证状态与结果解释限制
 
 模式与输入原则已经确定：官方 General 模板不做人工编辑、`mode=standard`、
-`retrievalMode=standard`，并且不增加 QA 动作硬限制。正式实验前还剩以下实施或环境验证项：
+`retrievalMode=standard`。旧轮次使用官方 8/4 预算；本次重跑使用 benchmark-only 的
+20 轮 Agent 决策和最多 15 次检索。正式 PaperScope 重跑前需完成：
 
-1. **服务器完整编译验证**：两个补丁已通过顺序 `git apply --check`，本地 TypeScript
-   类型检查与 mock 测试已通过；仍需在服务器的用户态 Node/Tauri sysroot 中完成 Rust/Linux
-   编译和 Xvfb 启动验证。
-2. **Agent trace smoke test**：不增加动作 allowlist，也不强制至少一次检索；但需验证真实
-   Ark 模型能稳定遵守 Agent JSON 协议，并确认逐题输出完整记录工具序列。直接 final 或理论
-   上出现的非检索动作保留为 Nashsu 官方行为，应通过 trace 审计而不是修改算法。
-3. **Recall 指标**：当前 Recall 为占位 0。若要比较检索质量，应定义基于 gold document IDs
+1. **服务器完整编译验证**：七个补丁可顺序应用；TypeScript typecheck、相关 Vitest、Rust
+   定向测试、Python 20 项单元测试和带 `tauri/custom-protocol` 的 Linux release 构建通过。
+2. **重启续批 smoke test**：Xvfb/WebKit readiness、完整进程组重启、重启后
+   `continuation=true` 的受保护脚手架校验均通过，未调用模型。
+3. **Agent trace 审计**：不强制每题调用固定检索工具，也不修改官方 Agent prompt。
+   正式 QA 的逐题输出会记录工具序列；raw source 只放开当前 benchmark 自有的
+   `raw/sources/.benchmark-<run-id>/`，其他隐藏路径仍不可见。可检索不代表 Agent 必然选择
+   `source.search`，其次数允许为 0。
+4. **Recall 指标**：当前 Recall 为占位 0。若要比较检索质量，应定义基于 gold document IDs
    或 evidence 的 Recall@K，并确保 Nashsu trace 可以映射回标准文档。
+5. **Doubao 1024 维 smoke test**：真实 API 1024 维探针通过；临时 Wiki 页面写入返回
+   `vectorsWritten=1`，唯一短语检索返回 `mode=hybrid`、`tokenHits=1`、`vectorHits=1`，
+   测试 corpus 随后由正式删除接口清除。
 
 General 脚手架恢复、`outputLanguage=auto`、官方默认 chunk 参数和
 `persistExtractedMarkdown=false` 已由 bridge 固定并进入 manifest。Judge usage 缺失按已确认
 策略只记录 `usage_complete=false`，不使实验失败；Judge token 不进入本实验要求的 Accuracy、
 端到端 QA、入库或删除成本指标。
 
-在这些项目确认之前，适合先做编译测试和极小 smoke test，不宜直接启动全部付费实验。
+上述 Recall 限制不影响本实验要求的 Accuracy、端到端回答时间和 token/入库/删除指标。

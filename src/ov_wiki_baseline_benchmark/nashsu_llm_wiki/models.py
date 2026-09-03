@@ -32,7 +32,7 @@ class RunInfo:
             raise RuntimeError("Bridge did not report the project scaffold")
         expected = {
             "template": "general",
-            "outputLanguage": "auto",
+            "outputLanguage": "English",
             "chunking": "official_default",
             "persistExtractedMarkdown": False,
         }
