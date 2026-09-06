@@ -373,6 +373,11 @@ class TencentDBRunner:
                     "loop_turns": turns,
                     "status": "success" if answer else "failed",
                     "retrieval_available": bool(tools),
+                    "failure_reason": None if answer else (
+                        "max_loop_turns_without_final_answer"
+                        if turns >= self.config.max_loop_turns
+                        else "no_final_text_answer"
+                    ),
                 }
             except Exception as exc:
                 return {
@@ -385,6 +390,7 @@ class TencentDBRunner:
                     "status": "failed",
                     "retrieval_available": bool(tools),
                     "error": str(exc),
+                    "failure_reason": "llm_or_agent_exception",
                 }
 
         results: dict[int, dict[str, Any]] = {}
@@ -401,12 +407,31 @@ class TencentDBRunner:
         qa_rows = _read_jsonl(group_dir / f"{experiment.spec.id}.qa.jsonl")
         llm = OpenAICompatibleClient(self.config, ledger)
         output = group_dir / f"{experiment.spec.id}.judge.jsonl"
-        existing = {str(r.get("qa_id")): r for r in _read_jsonl(output)}
+        # Cache entries are valid only for the exact answer that was judged.
+        # This prevents stale scores surviving a later QA rerun.
+        existing = {
+            str(r.get("qa_id")): r
+            for r in _read_jsonl(output)
+            if r.get("answer_sha256")
+        }
 
         def one(row: dict[str, Any]) -> dict[str, Any]:
             qa_id = str(row.get("qa_id"))
-            if qa_id in existing:
+            answer = str(row.get("answer") or "")
+            answer_hash = hashlib.sha256(answer.encode("utf-8")).hexdigest()
+            if qa_id in existing and existing[qa_id].get("answer_sha256") == answer_hash:
                 return existing[qa_id]
+            # Failed/empty QA must never be delegated to the judge.  A model
+            # judge can hallucinate a positive score for an empty response.
+            if row.get("status") != "success" or not answer.strip():
+                return {
+                    "qa_id": qa_id,
+                    "score": 0,
+                    "normalized_accuracy": 0.0,
+                    "reasoning": "QA failed or returned an empty answer; score forced to 0.",
+                    "answer_sha256": answer_hash,
+                    "qa_status": str(row.get("status", "")),
+                }
             prompt = _substitute(self.judge_prompt, {"question": str(row.get("question", "")), "gold_answers_joined_by_pipe": " | ".join(row.get("gold_answers", [])), "generated_answer": str(row.get("answer", ""))})
             score = 0
             reasoning = "judge failed"
@@ -423,7 +448,7 @@ class TencentDBRunner:
                 reasoning = str(parsed.get("reasoning", ""))
             except Exception as exc:
                 reasoning = str(exc)
-            return {"qa_id": qa_id, "score": score, "normalized_accuracy": score / 4.0, "reasoning": reasoning}
+            return {"qa_id": qa_id, "score": score, "normalized_accuracy": score / 4.0, "reasoning": reasoning, "answer_sha256": answer_hash, "qa_status": str(row.get("status", ""))}
         rows_by_id: dict[str, dict[str, Any]] = dict(existing)
         with ThreadPoolExecutor(max_workers=self.config.judge_workers) as pool:
             futures = [pool.submit(one, row) for row in qa_rows]
@@ -431,7 +456,10 @@ class TencentDBRunner:
                 result = future.result()
                 qa_id = str(result.get("qa_id"))
                 rows_by_id[qa_id] = result
-                if qa_id not in existing:
+                if not (
+                    qa_id in existing
+                    and existing[qa_id].get("answer_sha256") == result.get("answer_sha256")
+                ):
                     _append_jsonl(output, result)
         rows = [
             rows_by_id[str(qa["id"])]
