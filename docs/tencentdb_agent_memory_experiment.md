@@ -91,6 +91,9 @@ base_url: https://ark.cn-beijing.volces.com/api/v3
 api_key_env: ARK_API_KEY
 ```
 
+LoCoMo 使用 `baseline_configs/tencentdb_agent_memory_locomo.yaml`。模型仍为
+`doubao-seed-2-0-lite-260428`，仅将 QA 和 judge worker 数都设为 3。
+
 运行前在当前 shell 注入密钥；不要把密钥写入仓库、配置文件、日志或实验结果：
 
 ```bash
@@ -110,6 +113,11 @@ paperscope_summary_93_trend                 117 QA / 93 PDFs
 paperscope_summary_93_gap                   119 QA / 93 PDFs
 paperscope_summary_93_results_comparison   116 QA / 93 PDFs
 ```
+
+LoCoMo 的固定实验为 `locomo_10_all`：官方 10 份长期对话一次性进入同一个 Wiki，
+每个带时间戳的 session 转为一个 TXT，共 272 个文档和 1,986 个 QA。官方图片未发布，
+因此只保留对话文本、图片 caption 和搜索词，不下载图片。数据固定到上游 commit
+`3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376`。
 
 若尚未准备数据：
 

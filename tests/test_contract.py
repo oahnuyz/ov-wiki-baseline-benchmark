@@ -14,11 +14,13 @@ from ov_wiki_baseline_benchmark.specs import load_specs
 
 
 class ContractTests(unittest.TestCase):
-    def test_thirteen_experiment_specs(self) -> None:
+    def test_fourteen_experiment_specs(self) -> None:
         specs = load_specs()
-        self.assertEqual(len(specs), 13)
+        self.assertEqual(len(specs), 14)
         self.assertEqual(specs["enterprise_rag_bench_selected_80"].expected_qas, 80)
         self.assertEqual(specs["mudabench_complex"].expected_documents, 589)
+        self.assertEqual(specs["locomo_10_all"].expected_qas, 1986)
+        self.assertEqual(specs["locomo_10_all"].expected_documents, 272)
 
     def test_canonical_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:

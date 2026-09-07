@@ -1,0 +1,10 @@
+id: locomo_10_all
+dataset: locomo
+raw_dataset: LoCoMo10
+options:
+  scope: all
+  document_unit: session
+  source_revision: 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376
+expected:
+  qas: 1986
+  documents: 272

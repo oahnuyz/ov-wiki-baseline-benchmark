@@ -34,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("list", help="List the thirteen experiment variants")
+    subparsers.add_parser("list", help="List the fourteen experiment variants")
 
     prepare = subparsers.add_parser(
         "prepare", help="Download and prepare one or more experiment variants"

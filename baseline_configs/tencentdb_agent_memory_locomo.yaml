@@ -1,0 +1,22 @@
+memoryknowledge:
+  base_url: "http://127.0.0.1:8421/v3"
+  service_id: "benchmark-service"
+  team_id: "benchmark-team"
+  user_id: "benchmark-user"
+
+llm:
+  # Doubao Seed 2.0 Lite; identical to the existing TencentDB baseline.
+  model: "doubao-seed-2-0-lite-260428"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key_env: "ARK_API_KEY"
+
+execution:
+  request_timeout_seconds: 1200
+  poll_interval_seconds: 2
+  ingest_timeout_seconds: 86400
+  qa_workers: 3
+  judge_workers: 3
+  max_loop_turns: 15
+
+paths:
+  output_dir: "./Output/tencentdb"

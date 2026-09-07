@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any, Callable
 
 from .datasets import (
     enterprise_rag_bench,
+    locomo,
     mdaqa,
     mudabench,
     paperscope_summary,
@@ -509,6 +511,112 @@ def normalize_enterprise_rag_bench(
     )
 
 
+def normalize_locomo(
+    spec: ExperimentSpec, raw_dir: Path, output_dir: Path
+) -> dict[str, Any]:
+    if not locomo.verify_locomo_download(raw_dir):
+        raise ValueError(f"LoCoMo raw dataset failed verification: {raw_dir}")
+    samples = locomo.load_locomo(raw_dir / "locomo10.json")
+    locomo.validate_records(samples)
+
+    session_root = raw_dir / "sessions"
+    session_root.mkdir(parents=True, exist_ok=True)
+    documents: list[tuple[dict[str, Any], Path]] = []
+    canonical_by_session: dict[tuple[str, int], str] = {}
+    for sample in samples:
+        sample_id = str(sample["sample_id"])
+        conversation = sample["conversation"]
+        for number in locomo.session_numbers(conversation):
+            document_id = f"locomo:{sample_id}:session:{number}"
+            canonical_by_session[(sample_id, number)] = document_id
+            source_path = session_root / sample_id / f"session_{number:02d}.txt"
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            rendered = locomo.render_session(sample, number)
+            if not source_path.is_file() or source_path.read_text(
+                encoding="utf-8"
+            ) != rendered:
+                source_path.write_text(rendered, encoding="utf-8")
+            documents.append(
+                _canonical_document(
+                    dataset=spec.dataset,
+                    document_id=document_id,
+                    source_id=f"{sample_id}:session_{number}",
+                    source_path=source_path,
+                    output_path=f"corpus/{sample_id}/session_{number:02d}.txt",
+                    media_type="text/plain",
+                    original_record={
+                        "sample_id": sample_id,
+                        "session_number": number,
+                        "date_time": conversation.get(
+                            f"session_{number}_date_time"
+                        ),
+                        "speaker_a": conversation["speaker_a"],
+                        "speaker_b": conversation["speaker_b"],
+                        "turn_count": len(conversation[f"session_{number}"]),
+                    },
+                )
+            )
+
+    qas: list[dict[str, Any]] = []
+    for sample in samples:
+        sample_id = str(sample["sample_id"])
+        for qa_index, record in enumerate(sample["qa"]):
+            category = int(record["category"])
+            if category == 5:
+                gold_answers = [
+                    "No information available.",
+                    "Not mentioned in the conversation.",
+                ]
+            else:
+                gold_answers = [str(record["answer"])]
+            evidence = [str(value) for value in record.get("evidence", [])]
+            session_numbers = sorted(
+                {
+                    int(match.group(1))
+                    for value in evidence
+                    for match in re.finditer(r"D(\d+):\d+", value)
+                }
+            )
+            document_ids = [
+                canonical_by_session[(sample_id, number)]
+                for number in session_numbers
+                if (sample_id, number) in canonical_by_session
+            ]
+            qas.append(
+                _canonical_qa(
+                    spec=spec,
+                    qa_id=f"locomo:{sample_id}:qa:{qa_index:04d}",
+                    question=str(record["question"]),
+                    gold_answers=gold_answers,
+                    evidence=evidence,
+                    category=f"locomo_{category}",
+                    document_ids=document_ids,
+                    original_record=record,
+                    metadata={
+                        "sample_id": sample_id,
+                        "source_qa_index": qa_index,
+                        "source_category": category,
+                        "evidence_session_numbers": session_numbers,
+                    },
+                )
+            )
+    return _write_prepared(
+        spec,
+        output_dir,
+        documents,
+        qas,
+        {
+            "repository": "https://github.com/snap-research/locomo",
+            "revision": locomo.LOCOMO_REVISION,
+            "source_file": "data/locomo10.json",
+            "source_sha256": locomo.LOCOMO_SHA256,
+            "license": "CC BY-NC 4.0",
+            "document_unit": "session",
+            "all_conversations_in_one_corpus": True,
+        },
+    )
+
+
 NORMALIZERS: dict[
     str, Callable[[ExperimentSpec, Path, Path], dict[str, Any]]
 ] = {
@@ -518,6 +626,7 @@ NORMALIZERS: dict[
     "scholarqa_multi": normalize_scholarqa,
     "mudabench": normalize_mudabench,
     "enterprise_rag_bench": normalize_enterprise_rag_bench,
+    "locomo": normalize_locomo,
 }
 
 

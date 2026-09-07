@@ -2,7 +2,7 @@
 
 [English README](README.md)
 
-本项目为 OV-Wiki benchmark 提供一套与具体 baseline 无关的数据准备公共层。它负责下载并校验六个上游数据集，准备 13 组固定实验，将不同数据集的语料与 QA 统一成标准格式，并保存与 OV-Wiki 实验对齐的回答和评测 prompt。
+本项目为 OV-Wiki benchmark 提供一套与具体 baseline 无关的数据准备公共层。它负责下载并校验七个上游数据集，准备 14 组固定实验，将不同数据集的语料与 QA 统一成标准格式，并保存与 OV-Wiki 实验对齐的回答和评测 prompt。
 
 `main` 分支只维护公共的数据准备能力。接入某个 baseline 时，可以从 `main` 创建独立分支，在统一数据之上增加该 baseline 的入库、检索、回答生成、评测与日志逻辑。
 
@@ -24,7 +24,7 @@ uv sync
 uv run ov-wiki-data list
 ```
 
-该命令会列出 13 个固定的实验 ID，以及每组实验预期包含的 QA 和文档数量。
+该命令会列出 14 个固定的实验 ID，以及每组实验预期包含的 QA 和文档数量。
 
 ### 3. 下载并准备数据
 
@@ -42,7 +42,7 @@ uv run ov-wiki-data prepare \
   mudabench_complex
 ```
 
-准备全部 13 组实验：
+准备全部 14 组实验：
 
 ```bash
 uv run ov-wiki-data prepare --all
@@ -155,7 +155,7 @@ fork 需要实现的接口见
 
 ### 2. 通用 0–4 分 LLM Judge
 
-13 组实验统一采用同一套 LLM Judge 契约。机器可读的唯一模板为 [`prompts/generic_llm_judge_user.txt`](prompts/generic_llm_judge_user.txt)。
+14 组实验统一采用同一套 LLM Judge 契约。机器可读的唯一模板为 [`prompts/generic_llm_judge_user.txt`](prompts/generic_llm_judge_user.txt)。
 
 ```text
 You are an expert evaluator scoring how well an AI-generated answer matches a gold standard (ground truth).
@@ -192,9 +192,9 @@ Respond ONLY with a JSON object: {"score": 0 to 4, "reasoning": "string"}
 
 指标对齐规则：token-level F1 分别与 `gold_answers` 中的每个答案计算，取最大值；Accuracy 使用通用 Judge 返回的 0–4 整数分数。如果生成答案和至少一个 gold answer 都被判定为拒答或问题不可回答，则 F1 记为 `1.0`，Accuracy 记为 `4`。
 
-## 三、支持的 13 组数据集实验
+## 三、支持的 14 组数据集实验
 
-当前公共层覆盖六个数据集，共 13 份固定实验配置。
+当前公共层覆盖七个数据集，共 14 份固定实验配置。
 
 | 实验 ID | 数据集及范围 | QA 数 | 语料库 |
 |---|---|---:|---:|
@@ -211,6 +211,7 @@ Respond ONLY with a JSON object: {"score": 0 to 4, "reasoning": "string"}
 | `mudabench_simple` | MuDABench Simple QA，完整语料库 | 166 | 589 个 PDF |
 | `mudabench_complex` | MuDABench Complex QA，完整语料库 | 166 | 589 个 PDF |
 | `enterprise_rag_bench_selected_80` | Project Related、Conflicting Info、Completeness 三类 | 80 | 323 个 TXT |
+| `locomo_10_all` | 官方 10 份 LoCoMo 长期对话合并为一个语料库 | 1,986 | 272 个 session TXT |
 
 这些实验 ID 由 [`configs/`](configs/) 中的 YAML 文件固定定义。每份配置声明数据集处理器、原始数据目录名、预期 QA/文档数量以及该实验特有的筛选参数。
 
@@ -222,6 +223,7 @@ Respond ONLY with a JSON object: {"score": 0 to 4, "reasoning": "string"}
 - **ScholarQA-Multi**：保留原始专家答案，并在答案后附加从零开始的“引用编号 → 文献标题”映射；context 文本作为 evidence。
 - **MuDABench**：将 `final_answer` 作为 gold answer，将 `source_answer` 作为 evidence；数据中两条完全重复的 QA 仍作为不同物理记录保留。
 - **EnterpriseRAG-Bench**：将 `gold_answer` 作为 gold answer，将 `answer_facts` 作为 evidence；重复出现的逻辑文档会映射成不同的物理文档 ID。
+- **LoCoMo**：10 份长期对话共用一个语料库，每个带时间戳的 session 转为一个 TXT；第 1–4 类保留官方答案，第 5 类 adversarial QA 使用明确的“未提及”答案。
 
 ## 四、代码模块作用
 
@@ -247,10 +249,10 @@ schema.py 校验最终实验数据
 
 | 路径 | 作用 |
 |---|---|
-| `configs/` | 13 份声明式实验配置；实验数量和筛选范围不硬编码在 CLI 中。 |
+| `configs/` | 14 份声明式实验配置；实验数量和筛选范围不硬编码在 CLI 中。 |
 | `prompts/` | 各 baseline 共同使用的回答生成与 LLM Judge 机器模板。 |
 | `src/ov_wiki_baseline_benchmark/` | 可安装的 Python 包，包含完整公共数据准备流程。 |
-| `tests/` | 校验 13 份配置和统一数据 schema 的契约测试。 |
+| `tests/` | 校验 14 份配置和统一数据 schema 的契约测试。 |
 | `pyproject.toml` | Python 版本、项目依赖、打包信息以及 `ov-wiki-data` 命令入口。 |
 | `.gitignore` | 排除虚拟环境、缓存、生成的数据和本地编辑器文件。 |
 
@@ -260,7 +262,7 @@ schema.py 校验最终实验数据
 |---|---|
 | `__main__.py` | 支持执行 `python -m ov_wiki_baseline_benchmark`。 |
 | `cli.py` | 解析 `list`、`prepare`、`verify`，校验实验选择并输出执行结果。 |
-| `specs.py` | 将 YAML 配置加载为 `ExperimentSpec`，并校验固定 13 份配置的契约。 |
+| `specs.py` | 将 YAML 配置加载为 `ExperimentSpec`，并校验固定 14 份配置的契约。 |
 | `runner.py` | 将数据集 key 映射到下载器，管理 raw/prepared 路径，协调“下载 → 标准化 → 校验”。 |
 | `normalize.py` | 将数据集原生结构转换为统一的 `qa.jsonl`、`documents.jsonl`、`dataset_info.json` 和 `corpus/`，同时完成 gold answer 处理。 |
 | `schema.py` | 校验 schema 版本、必填字段、ID/路径唯一性、文档引用、文件大小和哈希。 |
@@ -276,6 +278,7 @@ schema.py 校验最终实验数据
 | `datasets/scholarqa_multi.py` | 排除引用编号越界的记录，将官方引用 contexts 合并为 413 个 TXT，并保留 101 条有效 QA。 |
 | `datasets/mudabench.py` | 准备完整的 589 篇 PDF，并分别筛选 Simple 或 Complex QA。 |
 | `datasets/enterprise_rag_bench.py` | 下载官方完整压缩包，但只提取三个目标类别所需的 323 个物理文档。 |
+| `datasets/locomo.py` | 固定并校验官方 10 对话数据快照，将 272 个带时间戳的 session 转为 TXT。 |
 
 ### 5. 统一数据契约
 

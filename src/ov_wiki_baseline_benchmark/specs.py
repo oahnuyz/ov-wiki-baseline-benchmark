@@ -1,4 +1,4 @@
-"""Load and validate the thirteen fixed experiment specifications."""
+"""Load and validate the fixed experiment specifications."""
 
 from __future__ import annotations
 
@@ -60,6 +60,6 @@ def load_specs(configs_dir: Path | None = None) -> dict[str, ExperimentSpec]:
             expected_documents=expected["documents"],
             options=options,
         )
-    if len(specs) != 13:
-        raise ValueError(f"Expected exactly 13 experiment configs, got {len(specs)}")
+    if len(specs) != 14:
+        raise ValueError(f"Expected exactly 14 experiment configs, got {len(specs)}")
     return specs

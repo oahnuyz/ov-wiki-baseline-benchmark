@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from .datasets import (
     enterprise_rag_bench,
+    locomo,
     mdaqa,
     mudabench,
     paperscope_summary,
@@ -86,6 +87,14 @@ def _download_enterprise(
     )
 
 
+def _download_locomo(spec: ExperimentSpec, raw_root: Path, force: bool) -> bool:
+    return locomo.download_locomo(
+        output_dir=raw_root / spec.raw_dataset,
+        force=force,
+        verify=True,
+    )
+
+
 DOWNLOADERS: dict[str, Callable[[ExperimentSpec, Path, bool], bool]] = {
     "paperscope_summary": _download_paperscope,
     "mdaqa": _download_mdaqa,
@@ -93,6 +102,7 @@ DOWNLOADERS: dict[str, Callable[[ExperimentSpec, Path, bool], bool]] = {
     "scholarqa_multi": _download_scholarqa,
     "mudabench": _download_mudabench,
     "enterprise_rag_bench": _download_enterprise,
+    "locomo": _download_locomo,
 }
 
 

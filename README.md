@@ -2,7 +2,7 @@
 
 [中文说明](README_zh.md)
 
-This repository provides a baseline-neutral data preparation layer for the OV-Wiki benchmark. It downloads and verifies six upstream datasets, prepares thirteen fixed experiment variants, normalizes their corpora and QA records, and preserves the prompts used by the OV-Wiki experiment for consistent generation and evaluation.
+This repository provides a baseline-neutral data preparation layer for the OV-Wiki benchmark. It downloads and verifies seven upstream datasets, prepares fourteen fixed experiment variants, normalizes their corpora and QA records, and preserves the prompts used by the OV-Wiki experiment for consistent generation and evaluation.
 
 The `main` branch contains only shared dataset preparation. A baseline-specific branch can consume the prepared files and add its own ingestion, retrieval, generation, evaluation, and logging code.
 
@@ -40,7 +40,7 @@ uv run ov-wiki-data prepare \
   mudabench_complex
 ```
 
-Prepare all thirteen experiments:
+Prepare all fourteen experiments:
 
 ```bash
 uv run ov-wiki-data prepare --all
@@ -153,7 +153,7 @@ and deletion metrics and are reported separately for audit.
 
 ### Generic 0–4 LLM judge
 
-All thirteen experiments use the same generic LLM judge contract. The single machine-readable source of truth is [`prompts/generic_llm_judge_user.txt`](prompts/generic_llm_judge_user.txt).
+All fourteen experiments use the same generic LLM judge contract. The single machine-readable source of truth is [`prompts/generic_llm_judge_user.txt`](prompts/generic_llm_judge_user.txt).
 
 ```text
 You are an expert evaluator scoring how well an AI-generated answer matches a gold standard (ground truth).
@@ -192,7 +192,7 @@ For metric alignment, token-level F1 is computed against every value in `gold_an
 
 ## 3. Supported experiment variants
 
-The project supports six datasets and thirteen fixed experiment configurations.
+The project supports seven datasets and fourteen fixed experiment configurations.
 
 | Experiment ID | Dataset and scope | QA | Corpus |
 |---|---|---:|---:|
@@ -209,6 +209,7 @@ The project supports six datasets and thirteen fixed experiment configurations.
 | `mudabench_simple` | MuDABench Simple QA, complete corpus | 166 | 589 PDFs |
 | `mudabench_complex` | MuDABench Complex QA, complete corpus | 166 | 589 PDFs |
 | `enterprise_rag_bench_selected_80` | Project Related, Conflicting Info, and Completeness | 80 | 323 TXT files |
+| `locomo_10_all` | All ten official LoCoMo conversations in one corpus | 1,986 | 272 session TXT files |
 
 The experiment IDs are fixed by the YAML files in [`configs/`](configs/). Each configuration declares the dataset handler, raw snapshot name, expected counts, and experiment-specific selection options.
 
@@ -220,6 +221,7 @@ The experiment IDs are fixed by the YAML files in [`configs/`](configs/). Each c
 - **ScholarQA-Multi:** the original expert answer is retained and followed by a zero-based citation-number-to-title key. Context text becomes evidence.
 - **MuDABench:** `final_answer` becomes the gold answer and `source_answer` becomes evidence. The two fully duplicated QA rows remain separate physical records.
 - **EnterpriseRAG-Bench:** `gold_answer` becomes the gold answer and `answer_facts` becomes evidence. Repeated logical documents are represented by separate physical document IDs.
+- **LoCoMo:** all ten conversations share one corpus; every timestamped session becomes one TXT document. Categories 1–4 preserve the released answer, while adversarial category 5 uses explicit unanswerable gold answers.
 
 ## 4. Code module guide
 
@@ -245,10 +247,10 @@ schema.py validates the prepared experiment
 
 | Path | Responsibility |
 |---|---|
-| `configs/` | Thirteen declarative experiment specifications. Counts and selection options live here instead of in the CLI. |
+| `configs/` | Fourteen declarative experiment specifications. Counts and selection options live here instead of in the CLI. |
 | `prompts/` | Machine-readable answer-generation and LLM-judge templates shared by baseline branches. |
 | `src/ov_wiki_baseline_benchmark/` | Installable Python package containing the common preparation pipeline. |
-| `tests/` | Contract tests for the thirteen configurations and canonical schemas. |
+| `tests/` | Contract tests for the fourteen configurations and canonical schemas. |
 | `pyproject.toml` | Python version, dependencies, packaging metadata, and the `ov-wiki-data` console entry point. |
 | `.gitignore` | Excludes environments, caches, generated data, and local editor artifacts. |
 
@@ -258,7 +260,7 @@ schema.py validates the prepared experiment
 |---|---|
 | `__main__.py` | Enables `python -m ov_wiki_baseline_benchmark`. |
 | `cli.py` | Parses `list`, `prepare`, and `verify`, validates experiment selection, and prints results. |
-| `specs.py` | Loads all YAML files into `ExperimentSpec` objects and validates the fixed thirteen-config contract. |
+| `specs.py` | Loads all YAML files into `ExperimentSpec` objects and validates the fixed fourteen-config contract. |
 | `runner.py` | Maps each dataset key to its downloader, manages raw/prepared paths, and coordinates download → normalize → verify. |
 | `normalize.py` | Converts dataset-native records into shared `qa.jsonl`, `documents.jsonl`, `dataset_info.json`, and `corpus/`; it also applies gold-answer transformations. |
 | `schema.py` | Enforces schema version, required fields, unique IDs/paths, valid document references, sizes, and checksums. |
@@ -274,6 +276,7 @@ schema.py validates the prepared experiment
 | `datasets/scholarqa_multi.py` | Removes records with invalid citation indices, merges official citation contexts into 413 TXT documents, and retains 101 valid QA records. |
 | `datasets/mudabench.py` | Prepares the full 589-PDF corpus and independently selects Simple or Complex QA records. |
 | `datasets/enterprise_rag_bench.py` | Downloads the official archive but extracts only the 323 physical documents required by the three selected categories. |
+| `datasets/locomo.py` | Pins and validates the official ten-conversation snapshot and renders 272 timestamped sessions as TXT documents. |
 
 ### Canonical data contract
 
